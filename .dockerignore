@@ -4,11 +4,17 @@
 **/.venv
 **/dist
 **/__pycache__
+**/*.pyc
 **/.mypy_cache
 **/.pytest_cache
 **/.ruff_cache
+**/.DS_Store
 **/test-results
 **/playwright-report
 rill-provider/docker/makers
 rill-provider/docker/stores
 rill-provider/docker/credentials
+
+# Local CMake build trees (the image builds rill-crypto itself).
+rill-crypto/build
+rill-crypto/cmake-build-*

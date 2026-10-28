@@ -3,11 +3,11 @@
 # regtest data with fixed, public credentials. Never point it at real funds.
 name: rillswap-dev
 
+# Shared settings for every service that runs the dev image. The image itself
+# is built once, by the `chain` service below; keeping `build:` out of this
+# anchor stops Compose from building and exporting a copy per service.
 x-rill: &rill
   image: rillswap-dev:local
-  build:
-    context: ..
-    dockerfile: dev/Dockerfile
   volumes:
     - ..:/src:ro
     - state:/state
@@ -334,6 +334,8 @@ services:
       anvil:
         condition: service_healthy
 
+  # The one service that builds rillswap-dev:local. Every other service using
+  # that image references it by name only, so it is built and loaded once.
   chain:
     image: rillswap-dev:local
     build:
