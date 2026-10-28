@@ -186,7 +186,7 @@ CONFLICT_LOSS_CONFIRMATIONS = 6  # depth of another spend of a deposit input tha
 CONFLICT_SCAN_MARGIN_BLOCKS = 144  # search for that spend from this far below the first claim
 CLAIM_URGENCY_BLOCKS = 6  # claim at the signed maximum fee this far before refund
 INCREMENTAL_RELAY_SAT_VB = 1  # BIP125 rule 4 at Core's default incremental relay fee
-READINESS_BUDGET_SECONDS = 10.0  # one shared bound for the whole offer preflight
+READINESS_BUDGET_SECONDS = 10.0  # bound each preflight or pre-submission sync retry window
 READINESS_SYNC_DELAY = 1.0
 COOPERATIVE_PROBE_SECONDS = 30
 COOPERATIVE_SAMPLE_SECONDS = 1.0
@@ -1372,7 +1372,7 @@ class SettlementEngine:
             self._store.observe_outpoint_spent(item.session_id, None)
         return item.state
 
-    async def _pay(  # noqa: PLR0911 - explicit exposure guards before the sole send
+    async def _pay(  # noqa: PLR0911, PLR0912 - exposure guards and pre-submission sync retry
         self,
         item: SettlementItem,
         terms: ContractTerms,
@@ -1435,7 +1435,21 @@ class SettlementEngine:
             item.session_id, invoice.payment_hash, payment.dispatch_record
         ):
             return outcome
-        return await asyncio.to_thread(self._lightning.send, payment)
+        # Only this exception proves SEND was never invoked. Reuse the committed
+        # in-memory plan briefly; never restore its grant or retry an ambiguous send.
+        deadline = time.monotonic() + READINESS_BUDGET_SECONDS
+        while True:
+            try:
+                return await asyncio.to_thread(self._lightning.send, payment)
+            except LndNotSyncedError:
+                if (
+                    not self._new_exposure_allowed
+                    or deadline - time.monotonic() <= READINESS_SYNC_DELAY
+                ):
+                    raise
+                await asyncio.sleep(READINESS_SYNC_DELAY)
+                if not self._new_exposure_allowed or time.monotonic() >= deadline:
+                    raise
 
     async def _funded_tip(self, binding: FundingBinding, terms: ContractTerms) -> int | None:
         """Return the sampled tip once the funding meets the signed depth, else None.

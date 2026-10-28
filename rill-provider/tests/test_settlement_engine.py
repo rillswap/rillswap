@@ -7,13 +7,15 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from rill_core.wire.messages import ContractTerms, FundingBinding
 
+from rill_provider import settlement_engine
 from rill_provider.live_session_store import SettlementItem
 from rill_provider.lnd_invoice_decode import InvoiceRejectedError
+from rill_provider.lnd_payment_observation import LndNotSyncedError, LndUnavailableError
 from rill_provider.lnd_payment_send import PaymentOutcome, PreparedPayment
 from rill_provider.payment_dispatch_record import PaymentAuthority
 from rill_provider.settlement_engine import SettlementEngine
@@ -159,6 +161,85 @@ def test_failed_preparation_does_not_consume_dispatch_permission() -> None:
         asyncio.run(engine._pay(ITEM, TERMS, BINDING, 1070, DOCUMENT["created_at"]))  # noqa: SLF001
     engine._store.commit_payment_dispatch.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
     lightning.send.assert_not_called()
+
+
+def test_pre_submission_sync_loss_retries_only_the_committed_in_memory_payment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _, lightning = _backends(PaymentOutcome("UNKNOWN"))
+    outcome = PaymentOutcome("SUCCEEDED", "42" * 32)
+    lightning.send.side_effect = [LndNotSyncedError(), LndNotSyncedError(), outcome]
+    sleep = AsyncMock()
+    monkeypatch.setattr(settlement_engine.asyncio, "sleep", sleep)
+
+    assert (
+        asyncio.run(
+            engine._pay(ITEM, TERMS, BINDING, 1070, DOCUMENT["created_at"])  # noqa: SLF001
+        )
+        == outcome
+    )
+    lightning.prepare.assert_called_once()
+    engine._store.commit_payment_dispatch.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+    assert len(lightning.send.call_args_list) == 3
+    for attempt in lightning.send.call_args_list:
+        assert attempt.args == (lightning.prepare.return_value,)
+        assert not attempt.kwargs
+    assert sleep.await_count == 2
+
+
+@pytest.mark.parametrize("during_wait", [False, True])
+@pytest.mark.parametrize("stop", ["budget", "exposure"])
+def test_pre_submission_sync_retry_stops_when_authority_or_budget_ends(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    during_wait: bool,
+    stop: str,
+) -> None:
+    engine, _, lightning = _backends(PaymentOutcome("UNKNOWN"))
+    clock = Mock(monotonic=Mock(return_value=1000.0))
+    monkeypatch.setattr(settlement_engine, "time", clock)
+
+    def end_retry() -> None:
+        if stop == "budget":
+            clock.monotonic.return_value = 1011.0
+        else:
+            engine.disable_new_exposure()
+
+    def unsynced(_: PreparedPayment) -> None:
+        if not during_wait:
+            end_retry()
+        raise LndNotSyncedError
+
+    async def sleep(_: float) -> None:
+        end_retry()
+
+    lightning.send.side_effect = unsynced
+    wait = AsyncMock(side_effect=sleep)
+    monkeypatch.setattr(settlement_engine.asyncio, "sleep", wait)
+    with pytest.raises(LndNotSyncedError):
+        asyncio.run(engine._pay(ITEM, TERMS, BINDING, 1070, DOCUMENT["created_at"]))  # noqa: SLF001
+    lightning.send.assert_called_once_with(lightning.prepare.return_value)
+    engine._store.commit_payment_dispatch.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+    assert wait.await_count == int(during_wait)
+
+
+@pytest.mark.parametrize("after_sync_retry", [False, True])
+def test_ambiguous_submission_never_retries_even_after_pre_submission_sync_loss(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    after_sync_retry: bool,
+) -> None:
+    engine, _, lightning = _backends(PaymentOutcome("UNKNOWN"))
+    failures: list[Exception] = [LndUnavailableError("submission outcome unknown")]
+    if after_sync_retry:
+        failures.insert(0, LndNotSyncedError())
+    lightning.send.side_effect = failures
+    monkeypatch.setattr(settlement_engine.asyncio, "sleep", AsyncMock())
+    with pytest.raises(LndUnavailableError, match="outcome unknown"):
+        asyncio.run(engine._pay(ITEM, TERMS, BINDING, 1070, DOCUMENT["created_at"]))  # noqa: SLF001
+    assert lightning.send.call_count == 1 + int(after_sync_retry)
+    lightning.prepare.assert_called_once()
+    engine._store.commit_payment_dispatch.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
 
 
 def test_older_unsupported_invoice_fails_without_dispatching() -> None:
