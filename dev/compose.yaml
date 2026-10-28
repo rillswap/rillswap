@@ -178,6 +178,7 @@ services:
       - --rpc-ssl=disabled
       - --disable-dns-checkpoints
       - --check-updates=disabled
+      - --db-sync-mode=fastest:async:1000000000bytes
     volumes:
       - monerod:/data
     healthcheck:
