@@ -431,7 +431,7 @@ test("the provider directory loads by itself, groups providers by swap type and 
   await expect(page.locator(".swap-provider-group")).toHaveCount(2);
   await expect(page.locator(".swap-provider-group h3")).toHaveText(["Bitcoin → Lightning", "Lightning → Bitcoin"]);
   const group = page.locator('.swap-provider-group[data-profile="ln-to-btc/v1"]');
-  await expect(group.locator("th")).toHaveText(["Provider", "Limits (sat)", "Fee", "On 100,000 sat", "Confirmations", "Listed until", ""]);
+  await expect(group.locator("th")).toHaveText(["Provider", "Limits (sat)", "Fee", "On 100,000 sat", "Confirmations", "Est. time", "Listed until", ""]);
   const entry = group.locator("tbody tr");
   await expect(entry).toHaveCount(1);
   await expect(entry.locator("td").nth(0)).toHaveText(`${identity.slice(0, 12)}…`);
@@ -440,6 +440,7 @@ test("the provider directory loads by itself, groups providers by swap type and 
   await expect(entry.locator("td").nth(2)).toHaveText("50 sat + 0.10%");
   await expect(entry.locator("td").nth(3)).toHaveText("150 sat");
   await expect(entry.locator("td").nth(4)).toHaveText("unknown"); // this announcement predates the depth extension
+  await expect(entry.locator("td").nth(5)).toHaveText("Time estimate unavailable");
   await expect(page.locator("#swap-provider-automatic button")).toHaveText("Selected");
   await entry.getByRole("button", { name: "Choose" }).click();
   // The choice applies to every table the provider appears in.

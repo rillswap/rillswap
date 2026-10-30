@@ -22,13 +22,16 @@ declare global {
     /** Signed funding depths of forward quotes "4" (1,104 sat) and "5" (1,105 sat); 1 each by default. */
     uiFixtureQuoteDepths?: [number, number];
     uiFixtureItemizedFees?: boolean;
+    uiFixtureFeeRates?: [number, number];
   }
 }
 window.uiFixture = { requests: [], executed: 0, executedProviders: [], disposed: 0, wallet: BrowserRecoveryWallet, infoPending: false };
 const fixtureFees = (index: number): FeeBreakdown => ({
   offer_event_id: "a".repeat(64), policy: { model: "p2tr-cooperative-1in-2out/v1", base_sat: "200", proportional_millionths: 0,
     max_network_feerate_sat_kvb: "2000", max_routing_fee_ppm: 1000 },
-  service_fee_sat: String(100 + index * 100), network_fee_sat: index === 0 ? "308" : "77", feerate_sat_kvb: index === 0 ? "2000" : "500",
+  service_fee_sat: String(100 + index * 100),
+  network_fee_sat: String(Math.ceil(154 * (window.uiFixtureFeeRates?.[index] ?? (index === 0 ? 2000 : 500)) / 1000)),
+  feerate_sat_kvb: String(window.uiFixtureFeeRates?.[index] ?? (index === 0 ? 2000 : 500)),
   estimated_at: Math.floor(Date.now() / 1000), issued_at: Math.floor(Date.now() / 1000),
 });
 export const MAX_QUOTE_PROVIDERS = 8;

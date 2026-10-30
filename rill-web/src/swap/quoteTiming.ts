@@ -8,7 +8,7 @@ export interface TimingMarket {
   readonly observedAt: number;
   readonly blockMinutes: number;
   readonly nextBlockRate: number;
-  readonly projectedMinimumRates: readonly number[];
+  readonly projectedBlocks: readonly { readonly minimumRate: number; readonly vbytes: number }[];
 }
 
 export interface QuoteTimingInput {
@@ -17,6 +17,8 @@ export interface QuoteTimingInput {
   /** A quote-time estimator sample, not a commitment to the eventual funding transaction's rate. */
   readonly fundingRate?: number;
   readonly claimFeeSat?: bigint;
+  /** Directory-only assumption before an amount/destination has a quote. */
+  readonly claimRate?: number;
   readonly destinationScriptBytes?: number;
 }
 
@@ -54,13 +56,13 @@ export async function readTimingMarket(base: string, network: NetworkName,
     ]);
     if (!Array.isArray(projected) || projected.length === 0 || projected.length > 32 ||
       !Array.isArray(recent) || recent.length < 6 || recent.length > 32) return null;
-    const minimumRates = projected.map((value) => {
+    const projectedBlocks = projected.map((value) => {
       const block = record(value), fees = block.feeRange;
       if (!positive(block.blockVSize) || !Array.isArray(fees) || fees.length === 0 || fees.length > 100 ||
         !fees.every((fee) => typeof fee === "number" && Number.isFinite(fee) && fee >= 0 && fee <= 1_000_000)) throw new Error("Timing projection unavailable");
-      // A stacked tail is not a single block. Do not pretend it bounds inclusion time.
-      return block.blockVSize > 1_000_000 ? Infinity : Math.min(...fees);
+      return { minimumRate: Math.min(...fees), vbytes: block.blockVSize };
     });
+    if (projectedBlocks.some((block, i) => block.vbytes > 1_000_000 && i !== projectedBlocks.length - 1)) return null;
     const blocks = recent.map(record);
     if (!blocks.every((block, i) => Number.isSafeInteger(block.height) && Number(block.height) >= 0 &&
       Number.isSafeInteger(block.timestamp) && positive(block.timestamp) &&
@@ -69,7 +71,7 @@ export async function readTimingMarket(base: string, network: NetworkName,
     const blockMinutes = (latest - oldest) / (blocks.length - 1) / 60;
     if (latest * 1000 < observedAt - 3 * 60 * 60_000 || latest * 1000 > observedAt + 2 * 60 * 60_000 ||
       !positive(blockMinutes) || blockMinutes > 120) return null;
-    return { observedAt, blockMinutes, nextBlockRate: nextBlockRate / 1000, projectedMinimumRates: minimumRates };
+    return { observedAt, blockMinutes, nextBlockRate: nextBlockRate / 1000, projectedBlocks };
   } catch { return null; }
 }
 
@@ -103,22 +105,26 @@ export function quoteTiming(input: QuoteTimingInput, market: TimingMarket | null
   const depth = input.fundingConfirmations;
   if (!Number.isSafeInteger(depth) || depth < 0 || depth > MAX_BLOCKS) return unavailable("Confirmation requirement unavailable.");
   if (depth === 0) return input.profile === "btc-to-ln/v1"
-    ? { text: "No confirmation wait", detail: "Payment starts when the provider sees the deposit; provider processing time is unknown." }
+    ? { text: "Estimated chain wait: 0 min (no confirmations)", detail: "Payment starts when the provider sees the deposit; provider processing time is unknown." }
     : unavailable("An unconfirmed funding and claim package needs a separate estimate; early claiming increases double-spend risk.");
   if (!market || now < market.observedAt || now - market.observedAt > MAX_AGE_MS) return unavailable("Fresh public fee-queue and block data are unavailable.");
-  const target = (rate: number): number | null => {
+  const target = (rate: number, vbytes: number): { blocks: number; spareSpace: boolean } | null => {
     if (!positive(rate)) return null;
-    const index = market.projectedMinimumRates.findIndex((minimum) => rate >= minimum);
-    return index < 0 ? null : index + 1;
+    // The lowest currently queued fee is not an admission floor. A sparse
+    // projected block can fit a newly admitted low-fee transaction as well.
+    // Reserve 10 kvB for coinbase/policy slack; a stacked tail is not one block.
+    const index = market.projectedBlocks.findIndex((block) => block.vbytes <= 1_000_000 &&
+      (rate >= block.minimumRate || block.vbytes + vbytes <= 990_000));
+    return index < 0 ? null : { blocks: index + 1, spareSpace: rate < market.projectedBlocks[index]!.minimumRate };
   };
   const fundingRate = input.profile === "btc-to-ln/v1" ? market.nextBlockRate : input.fundingRate ?? market.nextBlockRate;
   // Projected rates include integer miner-fee rounding. At 0.1 sat/vB, the
   // quote's 154 vB model pays 16 sat (0.103896 sat/vB), not a fractional 15.4.
   const fundingQueueRate = input.profile === "ln-to-btc/v1" && input.fundingRate !== undefined
     ? Math.ceil(fundingRate * Number(NETWORK_FEE_VBYTES)) / Number(NETWORK_FEE_VBYTES) : fundingRate;
-  const fundingTarget = target(fundingQueueRate);
+  const fundingTarget = target(fundingQueueRate, Number(NETWORK_FEE_VBYTES));
   if (fundingTarget === null) return unavailable("The estimated deposit rate is below the current fee forecast; inclusion time is unknown.");
-  let blocks = fundingTarget + depth - 1;
+  let blocks = fundingTarget.blocks + depth - 1, spareSpace = fundingTarget.spareSpace;
   let rates = input.profile === "btc-to-ln/v1"
     ? `Assumes your wallet deposits at the API's recommended ${fundingRate.toLocaleString()} sat/vB.`
     : input.fundingRate === undefined
@@ -127,21 +133,32 @@ export function quoteTiming(input: QuoteTimingInput, market: TimingMarket | null
   if (input.profile === "ln-to-btc/v1" && input.fundingRate !== undefined) rates += " Deposit queue position assumes the 154 vB pricing model with whole-satoshi fee rounding.";
   if (input.profile === "ln-to-btc/v1") {
     const bytes = input.destinationScriptBytes ?? 34;
-    if (input.claimFeeSat === undefined || input.claimFeeSat <= 0n || ![22, 34].includes(bytes)) return unavailable("Claim mining fee or destination size is unavailable.");
-    const rate = Number(input.claimFeeSat) / (121 + bytes), claimTarget = target(rate);
+    if (![22, 34].includes(bytes) || (input.claimFeeSat !== undefined && input.claimFeeSat <= 0n)) return unavailable("Claim mining fee or destination size is unavailable.");
+    const rate = input.claimFeeSat === undefined ? input.claimRate : Number(input.claimFeeSat) / (121 + bytes);
+    if (rate === undefined || !positive(rate)) return unavailable("Claim mining fee or destination size is unavailable.");
+    const claimTarget = target(rate, 121 + bytes);
     if (claimTarget === null) return unavailable("The claim fee is below the current fee forecast; inclusion time is unknown.");
-    blocks += claimTarget;
-    rates += ` Claim: ${input.claimFeeSat.toLocaleString()} sat (${rate.toFixed(2)} sat/vB for the larger script-path fallback).`;
-    if (input.destinationScriptBytes === undefined) rates += " Assumes a P2TR destination until final terms bind your address.";
+    blocks += claimTarget.blocks; spareSpace ||= claimTarget.spareSpace;
+    rates += input.claimFeeSat === undefined
+      ? ` No claim quote yet; assumes the API's recommended ${rate.toLocaleString()} sat/vB for the claim.`
+      : ` Claim: ${input.claimFeeSat.toLocaleString()} sat (${rate.toFixed(2)} sat/vB for the larger script-path fallback).`;
+    if (input.claimFeeSat !== undefined && input.destinationScriptBytes === undefined) rates += " Assumes a P2TR destination until final terms bind your address.";
   }
   if (blocks > MAX_BLOCKS) return unavailable("The confirmation wait exceeds the supported forecast.");
   const low = Math.max(1, Math.floor(blockWaitQuantile(blocks, 0.1, market.blockMinutes)));
   const high = Math.max(low + 1, Math.ceil(blockWaitQuantile(blocks, 0.9, market.blockMinutes)));
   return {
-    text: `Estimated chain wait: ${low} to ${high} min`,
+    text: `Estimated chain wait: ${low} to ${high} min${spareSpace ? " (spare-space estimate)" : ""}`,
     detail: `${rates} ${input.profile === "ln-to-btc/v1" ? "Through the first claim confirmation." : "Until the deposit depth allows Lightning payment."} ` +
       `Modeled 10th to 90th percentile block-time range, using recent ${market.blockMinutes.toFixed(1)} min blocks and today's fee queue. ` +
+      (spareSpace ? "A rate is below the lowest queued fee, but fits projected spare space if the broadcasting node relays it. " : "") +
       "Assumes transactions relay and current conditions hold; not a completion guarantee. Excludes your payment/signing time and provider processing." +
       (input.profile === "ln-to-btc/v1" ? " Key-path claims can be faster." : ""),
   };
+}
+
+/** Before quotes, compare the announced depth under the same explicit rate assumptions. */
+export function directoryTiming(profile: QuoteTimingInput["profile"], depth: number | null, market: TimingMarket | null, now = Date.now()): QuoteTiming {
+  if (depth === null) return { text: "Time estimate unavailable", detail: "The provider has not announced its confirmation requirement." };
+  return quoteTiming({ profile, fundingConfirmations: depth, ...(market ? { claimRate: market.nextBlockRate } : {}) }, market, now);
 }

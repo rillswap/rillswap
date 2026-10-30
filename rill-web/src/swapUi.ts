@@ -20,7 +20,7 @@ import { explorerTxUrl, trustedEvmAsset, validateEvmSponsor, validateMempoolApi,
 import { ConnectionPreferences, type ConnectionSettings, type ConnectionPreferenceState } from "./connectionPreferences";
 import { GasSponsor, newStagingSecret, stagingAddress } from "./swap/gasSponsor";
 import { readChainTip, readNextBlockFeeRate } from "./swap/chainTip";
-import { quoteTiming, readTimingMarket } from "./swap/quoteTiming";
+import { directoryTiming, quoteTiming, readTimingMarket, type QuoteTiming, type TimingMarket } from "./swap/quoteTiming";
 import { BrowserRecoveryWallet, parseWalletBackup } from "./browserRecoveryWallet";
 import { type DirectoryEntry, DIRECTORY_PROFILES, discoverDirectory, discoverMarketplace, eligibleProviders, indicativeFee, ineligibilityReason, quoteProviders, quoteReverseProviders,
   estimateFromDirectory, providerLimits, type LocatedQuote, MAX_QUOTE_PROVIDERS, quoteErc20Providers, quoteLnErc20Providers, selectEvmAsset, unexpired } from "./swap/marketplace";
@@ -243,7 +243,7 @@ function mount(root: HTMLElement): void {
   const closeProviders = node("button", "Close", "swap-providers-close");
   closeProviders.type = "button";
   providersHead.append(node("h2", "Providers"), closeProviders);
-  const providersIntro = node("p", "Maker pricing and limits are announced ceilings; quotes show the actual charges. Mining allowances are fixed maker charges, not actual miner fees. Claim and wallet fees are separate.", "swap-providers-intro");
+  const providersIntro = node("p", "Maker pricing and limits are announced ceilings; quotes show the actual charges. Mining allowances are fixed maker charges, not actual miner fees. Times assume recommended mining rates until you request fee-specific quotes. Claim and wallet fees are separate.", "swap-providers-intro");
   const reloadProviders = node("button", "Refresh", "swap-providers-load");
   reloadProviders.type = "button";
   const providersStatus = node("p", "", "swap-providers-status");
@@ -255,6 +255,27 @@ function mount(root: HTMLElement): void {
     "erc20-to-ln/v1": "Stablecoin → Lightning", "ln-to-erc20/v1": "Lightning → Stablecoin" };
   const FEE_SAMPLE = 100_000n;
   let directoryEntries: readonly DirectoryEntry[] = [];
+  let timingSnapshot: { network: NetworkName; api: string; market: TimingMarket | null } | undefined;
+  let timingPending: { network: NetworkName; api: string; promise: Promise<TimingMarket | null> } | undefined;
+  let timingGeneration = 0;
+  const observeTiming = (api: string, name: NetworkName, signal?: AbortSignal): Promise<TimingMarket | null> => {
+    const cached = timingSnapshot?.network === name && timingSnapshot.api === api ? timingSnapshot.market : null;
+    // Reuse public evidence for a minute across the directory and quote actions.
+    if (cached && Date.now() >= cached.observedAt && Date.now() - cached.observedAt < 60_000) return Promise.resolve(cached);
+    if (timingPending?.network === name && timingPending.api === api) return timingPending.promise;
+    const generation = ++timingGeneration;
+    const promise = readTimingMarket(api, name, signal ? { signal } : {}).then((market) => {
+      if (generation === timingGeneration && network.value === name && chainApi.value.trim() === api) {
+        timingSnapshot = { network: name, api, market }; timingPending = undefined;
+        renderDirectory();
+      }
+      return market;
+    });
+    timingPending = { network: name, api, promise };
+    renderDirectory();
+    return promise;
+  };
+  const invalidateTiming = (): void => { timingGeneration++; timingSnapshot = timingPending = undefined; renderDirectory(); };
   const showProviderChoice = (): void => {
     const pinned = identity.value.trim();
     providerChoice.textContent = pinned ? `Provider: ${pinned.slice(0, 12)}… (chosen by you)` : `Provider: automatic, ${automaticText()}`;
@@ -262,6 +283,8 @@ function mount(root: HTMLElement): void {
   /** One table per swap type; a provider serving several types appears in each of them. */
   const renderDirectory = (): void => {
     const pinned = identity.value.trim();
+    const market = timingSnapshot?.network === network.value && timingSnapshot.api === chainApi.value.trim() ? timingSnapshot.market : null;
+    const timingLoading = timingPending?.network === network.value && timingPending.api === chainApi.value.trim();
     const choose = (value: string, idle: string): HTMLButtonElement => {
       const control = node("button", value === pinned ? "Selected" : idle);
       control.type = "button"; control.dataset.provider = value; control.disabled = value === pinned;
@@ -277,8 +300,9 @@ function mount(root: HTMLElement): void {
       const group = node("section");
       group.className = "swap-provider-group"; group.dataset.profile = profile;
       const stablecoin = profile.includes("erc20");
+      const bitcoin = profile === "btc-to-ln/v1" || profile === "ln-to-btc/v1";
       const head = node("tr");
-      for (const title of ["Provider", ...(stablecoin ? ["Assets"] : []), "Limits (sat)", "Fee", `On ${FEE_SAMPLE.toLocaleString()} sat`, "Confirmations", "Listed until", ""]) {
+      for (const title of ["Provider", ...(stablecoin ? ["Assets"] : []), "Limits (sat)", "Fee", `On ${FEE_SAMPLE.toLocaleString()} sat`, "Confirmations", ...(bitcoin ? ["Est. time"] : []), "Listed until", ""]) {
         head.append(node("th", title));
       }
       const body = node("tbody");
@@ -289,6 +313,9 @@ function mount(root: HTMLElement): void {
         const who = node("td", `${entry.identity.slice(0, 12)}…`);
         who.title = `${entry.identity} · relays: ${entry.relayUrls.join(", ")}`;
         const fee = entry.indicativeFeePolicy;
+        const timing = bitcoin ? directoryTiming(profile, entry.fundingConfirmations, market) : null;
+        const timeCell = node("td", timingLoading ? "Loading..." : timing?.text.replace("Estimated chain wait: ", "") ?? "");
+        if (timing) timeCell.title = timing.detail;
         const cells = [who,
           ...(stablecoin ? [node("td", [...new Set(entry.evmAssets.map((asset) => asset.token_symbol))].join(", "))] : []),
           node("td", entry.amountBands.map((band) => `${BigInt(band.minimum_sat).toLocaleString()} – ${BigInt(band.maximum_sat).toLocaleString()}`).join(", ")),
@@ -296,6 +323,7 @@ function mount(root: HTMLElement): void {
             (entry.feePolicy ? ` + mining allowance (up to ${((NETWORK_FEE_VBYTES * BigInt(entry.feePolicy.max_network_feerate_sat_kvb) + 999n) / 1000n).toLocaleString()} sat)` : "")),
           node("td", `${entry.feePolicy ? "up to " : ""}${indicativeFee(fee, FEE_SAMPLE, entry.feePolicy).toLocaleString()} sat`),
           node("td", entry.fundingConfirmations === null ? "unknown" : String(entry.fundingConfirmations)),
+          ...(bitcoin ? [timeCell] : []),
           node("td", new Date(entry.expiresAt * 1000).toLocaleString())];
         const action = node("td"); action.append(choose(entry.identity, "Choose"));
         cells.forEach((cell, index) => { cell.dataset.label = head.children[index]!.textContent ?? ""; });
@@ -557,6 +585,7 @@ function mount(root: HTMLElement): void {
   const utilities = new Map<HTMLButtonElement, HTMLElement>();
   let selectedUtility: HTMLButtonElement | undefined;
   const showUtility = (button?: HTMLButtonElement, focus = true): void => {
+    const opening = button !== selectedUtility;
     selectedUtility = button;
     for (const [control, content] of utilities) {
       content.hidden = control !== button;
@@ -570,6 +599,7 @@ function mount(root: HTMLElement): void {
       title.focus({ preventScroll: true });
       content.scrollIntoView({ block: "nearest" });
     }
+    if (opening && button === providersButton && !connectionState.needsReset) void observeTiming(chainApi.value.trim(), network.value as NetworkName);
   };
   const addUtility = (button: HTMLButtonElement, content: HTMLElement): void => {
     button.type = "button";
@@ -663,10 +693,10 @@ function mount(root: HTMLElement): void {
     const chain = chainApi.value.trim(), send = broadcastApi.value.trim();
     chainDisclosure.textContent = `Mempool API ${chain} sees your IP and your swap's transactions` +
       (send === chain ? "; claims and refunds are sent there too." : `; claims and refunds are sent to ${send}.`) +
-      " Requesting quotes also fetches public fee and block data there for time estimates, without sending an address, invoice, or amount.";
+      " Opening Providers or requesting quotes also fetches public fee and block data there for time estimates, without sending an address, invoice, or amount.";
     relayDisclosure.textContent = `Provider listings load from your Nostr relays when the page opens (${relay.value.trim().split(/\s+/).join(", ")}). Relays see your IP.`;
   };
-  chainApi.oninput = () => { updateDisclosure(); recovery.clearFundingObservation(); };
+  chainApi.oninput = () => { invalidateTiming(); updateDisclosure(); recovery.clearFundingObservation(); };
   broadcastApi.oninput = () => { updateDisclosure(); recovery.clearFundingObservation(); };
   relay.oninput = updateDisclosure;
   const showConnectionState = (): void => {
@@ -679,6 +709,7 @@ function mount(root: HTMLElement): void {
     chainApi.value = state.values.mempoolApi;
     broadcastApi.value = state.values.broadcastApi;
     evmRpc.value = state.values.evmRpc;
+    invalidateTiming();
     showConnectionState();
   };
   for (const [field, control] of [
@@ -1243,7 +1274,7 @@ function mount(root: HTMLElement): void {
     void (async () => {
       try {
         if (await stopForPublishedUpdate(cancellation.signal)) return;
-        const timingPromise = readTimingMarket(chainApi.value.trim(), name, { signal: cancellation.signal });
+        const timingPromise = observeTiming(chainApi.value.trim(), name, cancellation.signal);
         const directory = await discoverMarketplace(urls, request.network, pinned || undefined, cancellation.signal, "ln-to-btc/v1");
         if (directory.providers.some(({ announcement }) => announcement.feePolicy)) {
           request = { ...request, networkFeeRateSatKvb: await readNextBlockFeeRate(chainApi.value.trim(), name, { signal: cancellation.signal }) };
@@ -1480,7 +1511,7 @@ function mount(root: HTMLElement): void {
         }
         if (cancelled) return;
         // A manual height override also opts out of these optional public chain reads.
-        const timingPromise = automaticTip ? readTimingMarket(api, name, { signal: cancellation.signal }) : Promise.resolve(null);
+        const timingPromise = automaticTip ? observeTiming(api, name, cancellation.signal) : Promise.resolve(null);
         const directory = await discoverMarketplace(urls, request.network, request.identity || undefined, cancellation.signal);
         if (directory.providers.some(({ announcement }) => announcement.feePolicy)) {
           request = { ...request, networkFeeRateSatKvb: await readNextBlockFeeRate(api, name, { signal: cancellation.signal }) };
@@ -1571,7 +1602,7 @@ function mount(root: HTMLElement): void {
           () => validateMempoolApi(chainApi.value.trim(), name), async (file) => {
             await (await walletPromise).saveFundedRecovery(name, file);
             await refreshSavedRecoveries();
-          });
+          }, timingFor(accepted.prepared.quote));
         if (paid) setStatus("Lightning invoice paid", 4, "success");
       } catch (error) {
         if (!cancelled) {
@@ -1710,6 +1741,7 @@ async function run(
   publish: (file: Uint8Array) => void,
   chainApi: () => string,
   persistFunded: (file: Uint8Array) => Promise<void>,
+  timing: QuoteTiming,
 ): Promise<boolean> {
   let fundsMayBeCommitted = false;
   // The backup stays below the stage while its prompts change, hidden until the first recovery file exists.
@@ -1724,6 +1756,7 @@ async function run(
     backups.hidden = false;
   };
   const stage = node("div", "", "swap-stage");
+  const initialWait = node("p", timing.text, "swap-tracking-time"); initialWait.title = timing.detail;
   panel.replaceChildren(stage, backups);
   panel = stage;
   try {
@@ -1737,7 +1770,11 @@ async function run(
         report(kind === "terms" ? "recovery file saved to the backups list" : "funded recovery file added to the backups list");
       },
       // Showing the address can commit funds: anything sent there is the user's deposit from that moment.
-      fundingSource: (funding) => fundingPrompt(panel, networkName, funding, chainApi, () => { fundsMayBeCommitted = true; }),
+      fundingSource: (funding) => {
+        const source = fundingPrompt(panel, networkName, funding, chainApi, () => { fundsMayBeCommitted = true; });
+        panel.querySelector("h2")!.after(initialWait);
+        return source;
+      },
       beforeFundingCommit: async () => { fundsMayBeCommitted = true; },
       broadcast: async (raw, txid) => {
         panel.replaceChildren(
@@ -1775,6 +1812,7 @@ async function run(
     report(`stopped: ${message}`);
     return false;
   } finally {
+    initialWait.remove();
     quote.dispose();
   }
 }

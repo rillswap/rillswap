@@ -225,6 +225,12 @@ provider's confirmations. An offer that waits longer than its provider
 announced is refused. This ranking does not claim to select the fastest completion.
 Use **Compare quotes** to inspect every returned Bitcoin quote and choose one
 before proceeding, even when **Continue** would accept a price within the preview.
+The Providers panel also shows an estimated time for both Bitcoin directions,
+using each announced confirmation depth and the same recommended-rate assumptions.
+It does not treat a provider's advertised pricing ceiling as its mining rate.
+Fee-specific estimates appear on quote cards; the Bitcoin funding view retains
+the estimate when Continue skips review. Zero-confirmation forward quotes show
+zero minutes of chain wait, with provider processing time still unknown.
 
 Bitcoin quote comparisons show the amount paid and received, maker service
 fees or rebates, the maker's fixed mining allowance when itemized, and the
@@ -234,10 +240,15 @@ and covers differences in transaction costs. Legacy quotes without a breakdown
 show a combined maker charge instead. Wallet deposit or Lightning routing fees
 remain extra, and the claim mining fee is already included in the Lightning total.
 
-Requesting Bitcoin quotes also reads public fee projections and recent blocks
+Opening Providers or requesting Bitcoin quotes reads public fee projections and recent blocks
 from the configured chain API (no addresses, amounts, invoices, or keys are sent).
 It never makes these reads on page load. Each quote shows a modeled chain-wait
-range in minutes when fresh data supports one. Fee bands estimate queue position;
+range in minutes when fresh data supports one. Public evidence is reused for a
+minute and scoped to its network and API. Fee bands and spare projected block
+capacity estimate queue position; a low fee below current queued fees can still
+fit a sparse block if the broadcasting node relays it. The model reserves 10 kvB
+of block space for policy/coinbase slack. These capacity-based estimates are
+labeled, not treated as proof of relay or miner acceptance. The
 recent block cadence and an exponential-arrival model produce the 10th to 90th
 percentile block-time range. This is conditional on current conditions and relay
 acceptance, not a measured completion probability or a guarantee. It excludes
@@ -251,7 +262,7 @@ The claim estimate uses the larger script-path fallback; a key-path claim pays
 the same reserve and can be faster. Quoted funding-rate estimates use the 154 vB
 pricing model with whole-satoshi rounding when matching projected fee bands
 (0.1 sat/vB becomes 16 sat for 154 vB). Funding-rate samples are not promises about
-the eventual transaction. Stale or missing data, below-forecast rates, and
+the eventual transaction. Stale or missing data, below-forecast rates without spare capacity, and
 on-demand regtest mining show no clock estimate. Zero-confirmation forward
 quotes show no confirmation wait; unconfirmed reverse packages are not modeled.
 An explicit Bitcoin to Lightning block-height override skips optional timing

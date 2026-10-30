@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
-import { blockWaitQuantile, quoteTiming, readTimingMarket, type TimingMarket } from "../src/swap/quoteTiming";
+import { blockWaitQuantile, directoryTiming, quoteTiming, readTimingMarket, type TimingMarket } from "../src/swap/quoteTiming";
 import type { ChainFetch } from "../src/swap/chainTip";
 
 const now = 1_793_355_200_000;
-const market: TimingMarket = { observedAt: now, blockMinutes: 10, nextBlockRate: 10, projectedMinimumRates: [10, 3, 1] };
+const market: TimingMarket = { observedAt: now, blockMinutes: 10, nextBlockRate: 10,
+  projectedBlocks: [10, 3, 1].map((minimumRate) => ({ minimumRate, vbytes: 999_000 })) };
 const forward = { profile: "btc-to-ln/v1" as const, fundingConfirmations: 1 };
 const reverse = { profile: "ln-to-btc/v1" as const, fundingConfirmations: 1, fundingRate: 3, claimFeeSat: 143n, destinationScriptBytes: 22 };
 
@@ -46,7 +47,7 @@ test("unknown funding rates use an explicit assumption, never an advertised ceil
 });
 
 test("a 0.1 sat/vB deposit model pays 16 sat for 154 vB, matching rounded projected fee bands", () => {
-  const signet = { ...market, nextBlockRate: 1, projectedMinimumRates: [16 / 154] };
+  const signet = { ...market, nextBlockRate: 1, projectedBlocks: [{ minimumRate: 16 / 154, vbytes: 20_000 }] };
   const estimate = quoteTiming({ ...reverse, fundingRate: 0.1 }, signet, now);
   expect(estimate.text).toBe("Estimated chain wait: 5 to 39 min");
   expect(estimate.detail).toContain("quoted 0.1 sat/vB");
@@ -54,7 +55,7 @@ test("a 0.1 sat/vB deposit model pays 16 sat for 154 vB, matching rounded projec
 });
 
 test("zero depth does not invent sequential confirmation waits or change the risk choice", () => {
-  expect(quoteTiming({ ...forward, fundingConfirmations: 0 }, null, now).text).toBe("No confirmation wait");
+  expect(quoteTiming({ ...forward, fundingConfirmations: 0 }, null, now).text).toBe("Estimated chain wait: 0 min (no confirmations)");
   expect(quoteTiming({ ...reverse, fundingConfirmations: 0 }, market, now).detail).toContain("package needs a separate estimate");
   expect(quoteTiming({ ...reverse, fundingConfirmations: 2 }, market, now).text).not.toBe(quoteTiming(reverse, market, now).text);
 });
@@ -71,7 +72,7 @@ test("missing, stale, below-horizon, and nonpositive fee evidence cannot produce
 });
 
 const recent = () => Array.from({ length: 15 }, (_, i) => ({ height: 100 - i, timestamp: now / 1000 - i * 600 }));
-const projected = [{ blockVSize: 950_000, feeRange: [10, 20] }, { blockVSize: 900_000, feeRange: [1, 3] }];
+const projected = [{ blockVSize: 999_000, feeRange: [10, 20] }, { blockVSize: 900_000, feeRange: [1, 3] }];
 const read = (blocks: unknown = recent(), queue: unknown = projected, extra: { signal?: AbortSignal } = {}) => {
   const requests: { url: string; options: RequestInit | undefined }[] = [];
   const fetch = (async (url, options) => {
@@ -83,7 +84,8 @@ const read = (blocks: unknown = recent(), queue: unknown = projected, extra: { s
 
 test("quote-time reads use only the configured network API and public bounded GETs", async () => {
   const { result, requests } = read();
-  expect(await result).toEqual({ observedAt: now, blockMinutes: 10, nextBlockRate: 2, projectedMinimumRates: [10, 1] });
+  expect(await result).toEqual({ observedAt: now, blockMinutes: 10, nextBlockRate: 2,
+    projectedBlocks: [{ minimumRate: 10, vbytes: 999_000 }, { minimumRate: 1, vbytes: 900_000 }] });
   expect(requests).toHaveLength(3);
   for (const request of requests) {
     expect(request.url.startsWith("https://chain.example/signet/api/v1/")).toBe(true);
@@ -106,10 +108,39 @@ test("recent cadence must be contiguous and fresh; malformed or unavailable data
   })).toBeNull();
 });
 
-test("underfull projections do not prove admission below the observed fee range; stacked tails are not a block", async () => {
-  const snapshot = await read(recent(), [{ blockVSize: 100, feeRange: [2, 10] }, { blockVSize: 2_000_000, feeRange: [0.1, 1] }]).result;
-  expect(quoteTiming({ ...reverse, fundingRate: 1 }, snapshot, now).text).toContain("unavailable");
-  expect(quoteTiming({ ...reverse, fundingRate: 2, claimFeeSat: 286n }, snapshot, now).text).toContain("min");
+test("sparse signet projects a low-fee deposit into spare space instead of treating observed fees as a relay floor", async () => {
+  const snapshot = await read(recent(), [{ blockVSize: 19_858.5, feeRange: [0.1942902458, 3917] }]).result;
+  const estimate = quoteTiming({ ...reverse, fundingRate: 0.1 }, snapshot, now);
+  expect(estimate.text).toBe("Estimated chain wait: 5 to 39 min (spare-space estimate)");
+  expect(estimate.detail).toContain("fits projected spare space if the broadcasting node relays it");
+  expect(estimate.detail).toContain("not a completion guarantee");
+  for (const fundingRate of [0, -1, NaN, Infinity]) {
+    expect(quoteTiming({ ...reverse, fundingRate }, snapshot, now).text).toContain("unavailable");
+  }
+});
+
+test("spare space can occur before the last projection; full forecasts and stacked tails do not invent a target", async () => {
+  const sparse = await read(recent(), [{ blockVSize: 100, feeRange: [2, 10] }, { blockVSize: 999_000, feeRange: [1, 2] }]).result;
+  expect(quoteTiming({ ...reverse, fundingRate: 1 }, sparse, now).text).toBe("Estimated chain wait: 5 to 39 min (spare-space estimate)");
+  const stacked = await read(recent(), [{ blockVSize: 999_000, feeRange: [2, 10] }, { blockVSize: 2_000_000, feeRange: [0.1, 1] }]).result;
+  expect(quoteTiming({ ...reverse, fundingRate: 1 }, stacked, now).text).toContain("unavailable");
+  expect(await read(recent(), [{ blockVSize: 2_000_000, feeRange: [1] }, { blockVSize: 100, feeRange: [1] }]).result).toBeNull();
+});
+
+test("capacity estimates leave 10 kvB slack and require space for the modeled transaction", () => {
+  const boundary = (vbytes: number): TimingMarket => ({ ...market, projectedBlocks: [{ minimumRate: 2, vbytes }] });
+  expect(quoteTiming({ ...reverse, fundingRate: 1, claimFeeSat: 286n }, boundary(990_000 - 154), now).text).toContain("spare-space estimate");
+  expect(quoteTiming({ ...reverse, fundingRate: 1, claimFeeSat: 286n }, boundary(990_000 - 153), now).text).toContain("unavailable");
+});
+
+test("the directory models both directions at recommended rates without inventing quoted claim fees or unknown depths", () => {
+  expect(directoryTiming("btc-to-ln/v1", 1, market, now).text).toBe("Estimated chain wait: 1 to 24 min");
+  const reverseDirectory = directoryTiming("ln-to-btc/v1", 1, market, now);
+  expect(reverseDirectory.text).toBe("Estimated chain wait: 5 to 39 min");
+  expect(reverseDirectory.detail).toContain("No claim quote yet; assumes");
+  expect(reverseDirectory.detail).not.toContain("Claim: 155 sat");
+  expect(directoryTiming("btc-to-ln/v1", null, market, now).detail).toContain("has not announced");
+  expect(directoryTiming("btc-to-ln/v1", 0, null, now).text).toContain("0 min");
 });
 
 test("regtest has no block clock, and cancellation makes no requests", async () => {

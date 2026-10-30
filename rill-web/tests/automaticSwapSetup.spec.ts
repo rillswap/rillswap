@@ -8,14 +8,15 @@ import { scriptAddress } from "../src/swap/address";
 const PAGE = "http://127.0.0.1:18765/test-only/swap.html";
 const API = "http://127.0.0.1:8091/api";
 
-async function liveTiming(page: Page, available = true): Promise<string[]> {
+async function liveTiming(page: Page, available = true,
+  projected = [{ blockVSize: 999_000, feeRange: [1, 10] }, { blockVSize: 500_000, feeRange: [0.1, 0.5] }]): Promise<string[]> {
   const api = "https://chain.example/signet/api", requests: string[] = [];
   await page.route(`${api}/**`, async (route) => {
     requests.push(route.request().url());
     expect(route.request().postData()).toBeNull();
     const path = new URL(route.request().url()).pathname, now = Math.floor(Date.now() / 1000);
     const body = path.endsWith("/mempool-blocks")
-      ? [{ blockVSize: 950_000, feeRange: [1, 10] }, { blockVSize: 500_000, feeRange: [0.1, 0.5] }]
+      ? projected
       : path.endsWith("/blocks") ? Array.from({ length: 15 }, (_, i) => ({ height: 100 - i, timestamp: now - i * 600 }))
         : path.endsWith("/recommended") ? { fastestFee: 3 } : undefined;
     await route.fulfill({ status: available || body === undefined ? 200 : 503,
@@ -453,4 +454,84 @@ test("Compare quotes retains reverse offers even with an address and a price wit
   await expect(page.locator("input[name=reverse-provider]")).toHaveCount(2);
   expect(await page.evaluate(() => window.uiFixture.disposed)).toBe(0);
   expect(await page.evaluate(() => window.uiFixture.reverseClaimFeeRates)).toBeUndefined();
+});
+
+test("a low-fee signet quote gets a conditional numeric wait when the projected block has spare space", async ({ page }) => {
+  await page.addInitScript(() => { window.uiFixtureItemizedFees = true; window.uiFixtureFeeRates = [100, 2000]; });
+  await liveTiming(page, true, [{ blockVSize: 19_858.5, feeRange: [0.1942902458, 3917] }]);
+  await page.getByRole("button", { name: "Switch direction" }).click();
+  await page.locator("#swap-receive-amount").fill("61000");
+  await page.locator("#swap-compare").click();
+  await expect(page.locator("#swap-quote-time")).toHaveText("Estimated chain wait: 11 to 54 min (spare-space estimate)");
+  await expect(page.locator("#swap-quote-summary")).toContainText("Maker mining allowance: 16 sat");
+  await page.locator("#swap-quote-summary").getByText("Time estimate assumptions", { exact: true }).click();
+  await expect(page.locator("#swap-quote-summary")).toContainText("if the broadcasting node relays it");
+});
+
+for (const width of [320, 390, 1440]) {
+  test(`Providers shows both Bitcoin timing columns at ${width}px, with lazy public reads and cached reuse`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 844 });
+    await page.addInitScript(() => { window.uiFixtureAnnouncedDepth = 1; });
+    const requests = await liveTiming(page);
+    await page.locator("#swap-providers-toggle").click();
+    const forwardTime = page.locator('.swap-provider-group[data-profile="btc-to-ln/v1"] td[data-label="Est. time"]');
+    const reverseTime = page.locator('.swap-provider-group[data-profile="ln-to-btc/v1"] td[data-label="Est. time"]');
+    await expect(forwardTime).toHaveText("1 to 24 min");
+    await expect(reverseTime).toHaveText("5 to 39 min");
+    await expect(reverseTime).toHaveAttribute("title", /No claim quote yet; assumes/);
+    await expect(page.locator("#swap-providers-intro")).toContainText("Times assume recommended mining rates");
+    expect(requests).toHaveLength(3);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.locator("#swap-providers-close").click();
+    await page.locator("#swap-providers-toggle").click();
+    await expect(forwardTime).toHaveText("1 to 24 min");
+    expect(requests).toHaveLength(3);
+  });
+}
+
+test("late directory timing cannot overwrite evidence for a different network and API", async ({ page }) => {
+  await page.addInitScript(() => { window.uiFixtureAnnouncedDepth = 1; });
+  await liveTiming(page);
+  let release: (() => void) | undefined;
+  await page.route("https://chain.example/signet/api/v1/blocks", async (route) => {
+    await new Promise<void>((resolve) => { release = resolve; });
+    const now = Math.floor(Date.now() / 1000);
+    await route.fulfill({ json: Array.from({ length: 15 }, (_, i) => ({ height: 100 - i, timestamp: now - i * 600 })),
+      headers: { "Access-Control-Allow-Origin": "http://127.0.0.1:18765" } });
+  });
+  await page.route("https://other-chain.example/testnet4/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname, now = Math.floor(Date.now() / 1000);
+    await route.fulfill({ json: path.endsWith("/blocks") ? Array.from({ length: 15 }, (_, i) => ({ height: 100 - i, timestamp: now - i * 1200 }))
+      : path.endsWith("/mempool-blocks") ? [{ blockVSize: 10_000, feeRange: [1, 10] }] : { fastestFee: 3 },
+      headers: { "Access-Control-Allow-Origin": "http://127.0.0.1:18765" } });
+  });
+  await page.locator("#swap-providers-toggle").click();
+  await expect.poll(() => !!release).toBe(true);
+  await page.locator("#swap-providers-close").click();
+  await openSettings(page, "connection");
+  await page.locator("#swap-network").selectOption("testnet4");
+  await page.locator("#swap-chain-api").fill("https://other-chain.example/testnet4/api");
+  await page.locator("#swap-settings-close").click();
+  await page.locator("#swap-providers-toggle").click();
+  const time = page.locator('.swap-provider-group[data-profile="btc-to-ln/v1"] td[data-label="Est. time"]');
+  await expect(time).toHaveText("2 to 47 min");
+  const oldResponse = page.waitForResponse("https://chain.example/signet/api/v1/blocks");
+  release!(); await (await oldResponse).finished();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(time).toHaveText("2 to 47 min");
+});
+
+test("the forward funding view keeps its minute estimate even when Continue skips quote review", async ({ page }) => {
+  await quotesWithinEstimate(page);
+  await page.addInitScript(() => {
+    window.uiFixtureQuoteDepths = [0, 0];
+  });
+  await liveTiming(page);
+  await page.evaluate(() => { window.uiFixture.fundingScript = `512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798`; });
+  const now = Math.floor(Date.now() / 1000);
+  await page.locator("#swap-invoice").fill(testInvoice("tracking-timing", "1000000", now, now + 7200, "tbs"));
+  await page.locator("#swap-start").click();
+  await expect(page.locator("#swap-funding-uri")).toBeVisible();
+  await expect(page.locator("#swap-tracking-time")).toHaveText("Estimated chain wait: 0 min (no confirmations)");
+  await expect(page.locator("#swap-quote-accept")).toHaveCount(0);
 });

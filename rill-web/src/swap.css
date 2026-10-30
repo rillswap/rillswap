@@ -139,7 +139,7 @@ details.utility-panel > summary { font-size: 1.1rem; font-weight: 650; }
 #swap-panel a { display: inline-block; margin: .4rem 0; font-size: .82rem; }
 #swap-quote-summary { padding: 1rem; background: #263337; border-radius: .8rem; }
 #swap-quote-summary h2, #swap-quote-kind + h2 { color: #b6eccd; font-size: 1.7rem; }
-#swap-quote-time, #swap-reverse-time { font-weight: 650; color: #b6eccd; }
+#swap-quote-time, #swap-reverse-time, #swap-tracking-time { font-weight: 650; color: #b6eccd; }
 .swap-quote-option { padding: .8rem; border: 1px solid #47605a; border-radius: .65rem; font-weight: 400; }
 .swap-quote-option:has(input:checked) { border-color: #b6eccd; background: #20382c; }
 #swap-quote-kind { margin-top: 0; }
@@ -150,6 +150,7 @@ details.utility-panel > summary { font-size: 1.1rem; font-weight: 650; }
 #swap-card[data-review="address"] label[for="swap-receive-address"] { margin-top: 0; }
 .swap-offer-tag { display: inline-block; margin: .2rem 0 .2rem .4rem; padding: .05rem .4rem; border-radius: .4rem; font-size: .68rem; color: #c2d2d5; border: 1px solid #47605a; }
 .swap-offer-tag.fastest, .swap-offer-tag.cheapest { color: #b6eccd; background: #20382c; }
+.swap-provider-group button { white-space: nowrap; }
 .swap-qr { display: block; width: min(13rem, 100%); height: auto; margin: 1rem auto; border-radius: .65rem; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; max-width: 100%; background: #111b1e; border: 1px solid #344347; border-radius: .65rem; font: .73rem/1.65 ui-monospace, monospace; padding: .85rem; color: #b6ccc5; max-height: 20rem; overflow: auto; }
 #swap-contract-address, #swap-reverse-invoice, #swap-reverse-payment-invoice { font-size: .72rem; }
