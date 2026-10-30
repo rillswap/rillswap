@@ -24,6 +24,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlsplit
 
+from rill_provider.diagnostics import diagnostic
 from rill_provider.notification_worker import AppriseWorker, WorkerError
 from rill_provider.operator_config import OperatorConfigError, read_private_file
 from rill_provider.swap_accounting import (
@@ -289,10 +290,33 @@ class Notifier:
                 f"{self._prefix}: {message.title}", message.body, warning=message.warning
             )
         except Exception as error:  # noqa: BLE001 - never echo URLs or payloads
-            LOG.warning("notification not delivered: %s", type(error).__name__)
+            diagnostic(
+                LOG,
+                "notification.failed",
+                f"notification not delivered: {type(error).__name__}",
+                level=logging.WARNING,
+                error_type=type(error).__name__,
+                event_count=len(messages),
+                delivery_status="failed_best_effort",
+            )
             return
         if not delivered:
-            LOG.warning("notification not delivered to every service")
+            diagnostic(
+                LOG,
+                "notification.failed",
+                "notification not delivered to every service",
+                level=logging.WARNING,
+                event_count=len(messages),
+                delivery_status="partial_or_failed_best_effort",
+            )
+        else:
+            diagnostic(
+                LOG,
+                "notification.accepted",
+                "Notification accepted by configured services",
+                event_count=len(messages),
+                delivery_status="accepted_not_device_receipt",
+            )
 
     def _swap_messages(self) -> list[Message]:
         settings = self._settings
@@ -329,6 +353,7 @@ class Notifier:
             for reason, available in (
                 ("chain tip", health.tip_available),
                 ("claim fee estimate", health.claim_fee_available),
+                ("settlement supervision", health.admission_ready),
             )
             if not available
         ]

@@ -63,6 +63,7 @@ from rill_provider.core_tx_bytes import (
     CoreReadError,
     CoreTransactionUnknownError,
 )
+from rill_provider.diagnostics import diagnostic_context
 from rill_provider.live_session_store import (
     MAX_CLAIM_ATTEMPTS,
     CooperativeClaimObservation,
@@ -78,6 +79,7 @@ from rill_provider.live_session_store import (
 from rill_provider.lnd_invoice_decode import InvoiceRejectedError
 from rill_provider.lnd_payment_observation import LndNotSyncedError, LndUnavailableError
 from rill_provider.reverse_settlement import HoldInvoiceBackend, ReverseSettlement
+from rill_provider.settlement_diagnostics import committed_transition, waiting_observation
 from rill_provider.settlement_policy import SettlementCrypto, offered_terms
 
 if TYPE_CHECKING:
@@ -288,6 +290,7 @@ class SettlementEngine:
         it, swaps of that profile are left untouched.
         """
         self._store = store
+        self._diagnostic_waiting: dict[str, str] = {}
         self._chain = chain
         self._lightning = lightning
         self._crypto = crypto
@@ -536,7 +539,7 @@ class SettlementEngine:
             raise LiveSessionStoreError("reverse cooperative verifier unavailable")
         return await self._reverse.verify_cooperative_completion(document, now)
 
-    async def complete_cooperative_claim(  # noqa: PLR0911 - preconsumption refusals, then one commit boundary
+    async def complete_cooperative_claim(  # noqa: PLR0911, PLR0912, PLR0915 - one commit boundary
         self,
         session_id: str,
         cooperation_id: bytes,
@@ -668,9 +671,19 @@ class SettlementEngine:
         except Exception:  # noqa: BLE001 - a failed preflight does not consume the native handle
             return None
         # No catch or automatic retry beyond this private-consumption boundary.
-        return self._store.commit_selected_cooperative_claim(
+        result = self._store.commit_selected_cooperative_claim(
             session_id, cooperation_id, observation, now=effect_clock
         )
+        if result is not None:
+            committed_transition(
+                LOG,
+                session_id,
+                "PAID",
+                "CLAIMING",
+                fallback.terms_offer,
+                claim_fee_sat=plan.fee_sat,
+            )
+        return result
 
     async def initiate_cooperative_proposal(  # noqa: PLR0911 - preflight refusals before the burn
         self, session_id: str, *, now: Callable[[], int]
@@ -831,6 +844,9 @@ class SettlementEngine:
                 continue  # re-read the new durable state on the next pass
             # Store failure (including StaleOwnerError) cannot be deferred:
             # do not begin serving with a possibly unselected paid swap.
+            committed_transition(
+                LOG, candidate.session_id, "PAID", "CLAIMING", candidate.terms_offer
+            )
             selected.append(candidate)
         return tuple(selected)
 
@@ -933,6 +949,14 @@ class SettlementEngine:
                 )
             except StaleSwapError:
                 continue
+            committed_transition(
+                LOG,
+                winner.session_id,
+                "PAID",
+                "CLAIMING",
+                winner.terms_offer,
+                claim_fee_sat=validated.fee_sat,
+            )
             promoted.append(winner)
         return tuple(promoted)
 
@@ -1042,9 +1066,16 @@ class SettlementEngine:
     async def tick(self, now: int) -> dict[str, str]:
         """Advance each swap at most through its available steps; return new states."""
         results: dict[str, str] = {}
-        for item in self._store.settlement_work():
+        work = self._store.settlement_work()
+        self._diagnostic_waiting = {
+            item.session_id: self._diagnostic_waiting[item.session_id]
+            for item in work
+            if item.session_id in self._diagnostic_waiting
+        }
+        for item in work:
             try:
-                state = await self._advance(item, now)
+                with diagnostic_context(session_id=item.session_id, state=item.state):
+                    state = await self._advance(item, now)
             except StaleOwnerError:
                 raise  # a fenced/uncertain store cannot defer economic work
             except StaleSwapError:
@@ -1060,7 +1091,11 @@ class SettlementEngine:
                 )
                 continue
             if state != item.state:
+                self._diagnostic_waiting.pop(item.session_id, None)
                 results[item.session_id] = state
+            elif self._diagnostic_waiting.get(item.session_id) != state:
+                waiting_observation(LOG, item.session_id, state, item.terms_offer)
+                self._diagnostic_waiting[item.session_id] = state
         for session_id in await self._close_unfunded(now):
             results[session_id] = "FAILED"
         await self._release_expired()
@@ -1108,6 +1143,7 @@ class SettlementEngine:
             except Exception:  # noqa: BLE001 - one swap's trouble never stops others
                 LOG.warning("unfunded swap closure deferred", exc_info=False)
                 continue
+            committed_transition(LOG, session_id, "ACCEPTED", "FAILED", offer)
             closed.append(session_id)
         return closed
 
@@ -1136,6 +1172,7 @@ class SettlementEngine:
             **fields,  # type: ignore[arg-type]
         )
         self._conflict_scans.pop(item.session_id, None)  # only CLAIMING swaps search
+        committed_transition(LOG, item.session_id, item.state, to_state, item.terms_offer, **fields)
         return to_state
 
     async def _advance(  # noqa: PLR0911, PLR0912 - one ordered lifecycle per state

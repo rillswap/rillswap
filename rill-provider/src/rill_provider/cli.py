@@ -23,6 +23,14 @@ from rill_core.errors import ValidationError
 from rill_core.networks import require_supported_network
 
 from rill_provider.core_tx_bytes import CoreTransactionReader
+from rill_provider.diagnostics import (
+    CHATTY_LIBRARY_LOGGERS as _LIBRARY_LOGGERS,
+)
+from rill_provider.diagnostics import (
+    configure_logging,
+    diagnostic,
+    diagnostic_context,
+)
 from rill_provider.dynamic_pricing import BTC_RESERVE, LiquiditySample, LiquiditySampler
 from rill_provider.evm_htlc import EvmBackendError, EvmHtlcClient
 from rill_provider.evm_quote_policy import EVM_PROFILES, EvmQuotePrices
@@ -72,10 +80,11 @@ if TYPE_CHECKING:
     from rill_crypto import Context
 
 REFUSED = 2
+# Preserve the entrypoint's existing logger-policy surface.
+CHATTY_LIBRARY_LOGGERS = _LIBRARY_LOGGERS
 # Client libraries that log every request at INFO (httpx: each Core RPC call).
 # They only speak up at WARNING unless --log-level DEBUG asks for everything.
 # Apprise runs in its own process, which logs nothing (notification_worker).
-CHATTY_LIBRARY_LOGGERS = ("httpx", "httpcore", "urllib3", "web3")
 
 
 def _context(library: Path) -> Context:
@@ -573,6 +582,45 @@ async def _serve(config: OperatorConfig, crypto: Context, custody: str) -> None:
                 await notifier.close(failed=failed)  # while the store is still held
 
 
+async def _test_notification(config: OperatorConfig) -> int:
+    """Explicitly test the configured route without opening financial state."""
+    settings = config.notifications
+    if settings is None:
+        raise OperatorConfigError("notifications are not configured")
+    proxy = require_relay_route(
+        config.network, config.relay_proxy, allow_direct=config.allow_direct_relays
+    )
+    try:
+        async with notification_sender(settings, proxy) as sender:
+            if sender is None:
+                raise OperatorConfigError(  # noqa: TRY301 - explicit configuration refusal
+                    "notification sender unavailable"
+                )
+            accepted = await sender.send(
+                f"RillSwap {config.handshake.profile} ({config.network.name}): notification test",
+                "Operator-requested notification test. No swap was started.",
+                warning=False,
+            )
+    except OperatorConfigError:
+        raise
+    except Exception as error:  # noqa: BLE001 - never echo service URLs or upstream errors
+        diagnostic(
+            logging.getLogger(__name__),
+            "notification.test_failed",
+            "Notification test failed",
+            level=logging.WARNING,
+            error_type=type(error).__name__,
+        )
+        return REFUSED
+    diagnostic(
+        logging.getLogger(__name__),
+        "notification.test",
+        "Notification test finished",
+        delivery_status="accepted" if accepted else "failed",
+    )
+    return 0 if accepted else REFUSED
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rill-provider", description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -583,6 +631,7 @@ def _parser() -> argparse.ArgumentParser:
     for name, text in (
         ("provision-store", "create a new empty live session store"),
         ("serve", "run the handshake service until SIGINT/SIGTERM"),
+        ("test-notification", "send an explicit test without opening the swap store"),
     ):
         command = commands.add_parser(name, help=text)
         command.add_argument("--config", type=Path, required=True)
@@ -600,24 +649,24 @@ def _parser() -> argparse.ArgumentParser:
     reconciliation.add_argument("--config", type=Path, required=True)
     reconciliation.add_argument("--session-id", required=True)
     parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING"))
+    parser.add_argument("--log-format", default="text", choices=("text", "json"))
     return parser
 
 
-def _configure_logging(level: str) -> None:
-    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
-    if level != "DEBUG":
-        for name in CHATTY_LIBRARY_LOGGERS:
-            logging.getLogger(name).setLevel(logging.WARNING)
+def _configure_logging(level: str, log_format: str = "text") -> None:
+    configure_logging(level, log_format=log_format)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one operator command; return the process exit status."""
     args = _parser().parse_args(argv)
-    _configure_logging(args.log_level)
+    _configure_logging(args.log_level, args.log_format)
     try:
         if args.command == "provision-identity":
             return _provision_identity(args)
         config = load_config(args.config)
+        if args.command == "test-notification":
+            return asyncio.run(_test_notification(config))
         if args.command == "provision-store":
             return _provision_store(config)
         custody = read_custody_identity(config.custody_identity_file)
@@ -627,7 +676,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             elif args.command == "reconcile-payment":
                 _reconcile_payment(config, crypto, custody, args)
             else:
-                asyncio.run(_serve(config, crypto, custody))
+                with diagnostic_context(
+                    network=config.network.name, profile=config.handshake.profile
+                ):
+                    diagnostic(logging.getLogger(__name__), "service.starting", "Starting provider")
+                    asyncio.run(_serve(config, crypto, custody))
+                    diagnostic(logging.getLogger(__name__), "service.stopped", "Provider stopped")
     except (
         OperatorConfigError,
         LiveSessionStoreError,

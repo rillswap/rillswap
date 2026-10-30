@@ -445,7 +445,16 @@ Passwords/seeds/preimages are read from protected prompts/stdin or configured se
 
 Notifications are optional. They default to “swap requires attention” plus a local opaque reference. No invoice, preimage, destination, exact amount, transaction ID, or secret-bearing URL by default. Richer notifications require explicit disclosure settings. Treat notification tokens/URLs as secrets and honor the same Tor/egress policy. An unavailable notification service must not block invoice settlement, signing, refunds, or the watcher.
 
-Provider logs/metrics are aggregate and redacted; do not label metrics with payment hashes, addresses, invoices, or stable customer identifiers. Redaction tests use known synthetic secrets. Expose admin actions locally with authentication. Run containers as non-root, restrict writable directories, avoid Docker socket mounts, and use health checks that measure chain/LN/reconciliation readiness rather than process existence.
+Local provider diagnostics may include per-swap payment/invoice hashes, amounts,
+fees and bounded, escaped invoice memos at INFO. Treat these logs as financially
+sensitive. Never log full invoices, preimages, keys, credentials, recovery data
+or stable customer identifiers. Metrics remain aggregate: do not label them with
+payment hashes, addresses, invoices, or stable customer identifiers. Notifications
+retain their separate disclosure policy; diagnostic exports omit financial details.
+Redaction tests use known synthetic secrets. Expose admin actions locally with
+authentication. Run containers as non-root, restrict writable directories, avoid
+Docker socket mounts, and use health checks that measure chain/LN/reconciliation
+readiness rather than process existence.
 
 ## 21. End-to-end testing
 

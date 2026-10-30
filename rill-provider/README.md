@@ -686,6 +686,27 @@ different relays, and reconnects, never share a circuit, so one slow or
 censoring exit cannot cut every relay at once. This needs no torrc change;
 only `NoIsolateSOCKSAuth` on the `HTTPTunnelPort` turns it off.
 
+### Logging
+
+Provider logs use UTC timestamps, severity, event names and per-swap context.
+Committed state changes and significant waits are reported at INFO, including
+the payment hash, invoice SHA256, amounts, signed fees and known actual costs.
+Unknown costs remain unknown. Invoice memos appear only when decoded, are
+bounded and escaped, and are never added to signed terms or stored metadata.
+Full invoices, preimages, keys, credentials and recovery documents are not
+diagnostic fields. Treat local logs as financially sensitive, not public bug reports.
+
+```sh
+rill-provider --log-level DEBUG serve --config provider.json
+rill-provider --log-format json serve --config provider.json
+```
+
+Text output has terminal colors only on a TTY (`NO_COLOR` disables them).
+JSON is newline-delimited, suitable for log collectors. Flags precede the
+subcommand. Docker uses the same readable text format by default; override the
+service command to select JSON. Logging introduces no store migration and does
+not replay old events on restart. A log is not a durable financial audit journal.
+
 ### Notifications
 
 The optional `notifications` section sends operator notifications through
@@ -771,6 +792,18 @@ Notifications are best effort and never affect serving. Nothing about them is
 persisted: events that happen while the service is stopped are not sent one
 by one, but the next daily summary counts them. Failed deliveries are logged
 without the URL.
+
+Test the configured destinations and Tor policy without opening the swap store:
+
+```sh
+rill-provider test-notification --config provider.json
+```
+
+This explicit command can run while the provider serves. Exit 0 means the
+configured services accepted the test, not that a device displayed it. Delivery
+diagnostics contain status and counts, never service URLs or message bodies.
+Settlement-supervision failures also participate in the delayed `quotes_paused`
+alert. Existing summary disclosure settings and best-effort delivery are unchanged.
 
 When `relay_proxy` is set and `use_tor` is on (the default), every
 notification goes through Tor and never falls back to a direct connection:

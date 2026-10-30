@@ -27,10 +27,11 @@ from rill_core.wire.fee_policy import (
 )
 from rill_core.wire.hashes import canonical_model
 from rill_core.wire.messages import Envelope, InvoiceBinding
-from rill_core.wire.quotes import QuoteError, parse_quote_request
+from rill_core.wire.quotes import QuoteError, TermsOfferPayload, parse_quote_request
 from rill_core.wire.reverse_quotes import ReverseFirmQuoteRequest
 
 from rill_provider import _transport_pow as transport_pow
+from rill_provider.diagnostics import diagnostic, diagnostic_context
 from rill_provider.dynamic_pricing import DynamicPricing, FeeLimits, LiquiditySample
 from rill_provider.evm_quote_policy import EVM_PROFILES, ln_to_erc20_hold_msat
 from rill_provider.liquidity_cap import LiquidityCap
@@ -61,6 +62,7 @@ from rill_provider.quote_policy import (
     success_fee,
 )
 from rill_provider.relay_client import RelayConnection, RelayError
+from rill_provider.settlement_diagnostics import terms_facts
 from rill_provider.settlement_policy import answer_client_request
 
 if TYPE_CHECKING:
@@ -188,6 +190,7 @@ class ServiceHealth:
     announcing: bool  # liquidity covers at least one amount band
     tip_available: bool  # quotes need the chain tip
     claim_fee_available: bool  # LN to BTC quotes with an automatic claim reserve
+    admission_ready: bool = True  # supervision failures pause new exposure, not recovery
 
 
 @dataclass(slots=True)
@@ -202,6 +205,7 @@ class _State:
     announcement: bytes | None = None  # exact bytes, retransmitted unchanged
     announcement_expires: int = 0
     republish: bool = False
+    announcement_warned: bool = False
     # Bands of the last announcement; quotes admit exactly these. Empty while
     # liquidity covers no band (nothing is announced then).
     bands: tuple[tuple[int, int], ...] = ()
@@ -300,6 +304,7 @@ class HandshakeService:
             announcing=bool(state.bands),
             tip_available=self._chain_tip is None or state.tip is not None,
             claim_fee_available=self._claim_fee is None or state.claim_fee is not None,
+            admission_ready=self._deadline_healthy and not self._readiness_closed,
         )
 
     def _now(self) -> int:
@@ -744,16 +749,20 @@ class HandshakeService:
             await self._announce(epochs, now)
         if state.republish and state.announcement and now < state.announcement_expires:
             state.republish = not await self._publish(state.announcement, relays)
-            if state.republish:
+            if state.republish and not state.announcement_warned:
                 LOG.warning("announcement not accepted by any relay; will retry")
+                state.announcement_warned = True
+            elif not state.republish and state.announcement_warned:
+                diagnostic(
+                    LOG, "announcement.accepted", "A relay accepted the provider announcement"
+                )
+                state.announcement_warned = False
         await self._resubscribe(relays)
         if self._settlement is not None:
             for session_id, moved in (await self._settlement.tick(now)).items():
-                LOG.info("swap %s moved to %s", session_id[:16], moved)
                 await self._begin_paid_probe(session_id, moved, relays)
         if self._evm_settlement is not None:
-            for session_id, moved in (await self._evm_settlement.tick(now)).items():
-                LOG.info("EVM swap %s moved to %s", session_id[:16], moved)
+            await self._evm_settlement.tick(now)
         entries = self._store.pending_outbox()
         for entry in entries:
             self._remember_urgent(entry.canonical_bytes, entry.message_id)
@@ -1513,6 +1522,7 @@ class HandshakeService:
         policy = terms.fee_policy
         if policy is None or self._claim_fee is None:
             return terms
+        stage = "request_validation"
         try:
             request = parse_quote_request(canonicalize(json.loads(document)["payload"]))
             binding = parse_fee_request(request.extensions)
@@ -1525,10 +1535,12 @@ class HandshakeService:
             else:
                 raise ValueError("Bitcoin profile required for network fees")  # noqa: TRY301
             sampled_at = max(terms.now, self._deadline_now())
+            stage = "fee_sample"
             fee = await asyncio.wait_for(
                 asyncio.to_thread(self._claim_fee), timeout=CLAIM_FEE_WAIT_SECONDS
             )
             rate = max(fee.rate_sat_kvb, fee.floor_sat_kvb)
+            stage = "fee_policy"
             if rate > min(
                 int(policy.max_network_feerate_sat_kvb),
                 int(binding.max_network_feerate_sat_kvb),
@@ -1557,7 +1569,16 @@ class HandshakeService:
             if int(breakdown.network_fee_sat) > spend_cap:
                 return terms
         except Exception as error:  # noqa: BLE001 - failures grant no hold or pricing authority
-            LOG.warning("network fee quote unavailable (%s)", type(error).__name__)
+            diagnostic(
+                LOG,
+                "quote.fee_unavailable",
+                f"network fee quote unavailable ({type(error).__name__})",
+                level=logging.WARNING,
+                operation=stage,
+                error_type=type(error).__name__,
+                reason="no_bound_network_fee_quote",
+                profile=terms.profile,
+            )
             return terms
         return replace(terms, now=issued_at, fee_breakdown=breakdown)
 
@@ -1609,12 +1630,36 @@ class HandshakeService:
             now = max(now, self._deadline_now())
             terms = replace(terms, now=now)
         sent: list[str] = []
+        facts: dict[str, object] = {}
 
         def responder(
             request: Envelope, prior: tuple[Envelope, ...], context: RequestContext
         ) -> Answer:
             answer = answer_client_request(request, prior, context, terms, self._transport)
             sent.append(answer.message_type)
+            try:
+                facts.update(request_type=request.message_type, disposition=answer.message_type)
+                if answer.message_type == "terms_offer":
+                    offered = parse_model_json(TermsOfferPayload, canonicalize(answer.payload))
+                    facts.update(terms_facts(offered.terms.contract_terms))
+                elif (
+                    context.replied_to is not None
+                    and context.replied_to.message_type == "terms_offer"
+                ):
+                    offered = parse_model_json(
+                        TermsOfferPayload, canonicalize(context.replied_to.payload)
+                    )
+                    facts.update(terms_facts(offered.terms.contract_terms))
+                if answer.message_type == "error":
+                    facts["reason"] = answer.payload.get("code")
+                if terms.fee_breakdown is not None:
+                    facts.update(
+                        service_fee_sat=terms.fee_breakdown.service_fee_sat,
+                        network_fee_sat=terms.fee_breakdown.network_fee_sat,
+                        fee_rate_sat_kvb=terms.fee_breakdown.feerate_sat_kvb,
+                    )
+            except Exception:  # noqa: BLE001, S110 - diagnostics never change the answer
+                pass
             if (
                 answer.message_type == "error"
                 and answer.payload.get("code") == "capacity_unavailable"
@@ -1630,6 +1675,16 @@ class HandshakeService:
         answer = self._store.answer_request(
             document, responder=responder, signer=self._transport, now=now
         )
+        with suppress(Exception):  # post-commit diagnostics cannot change admission
+            diagnostic(
+                LOG,
+                "request.replayed" if answer.replay else "request.answered",
+                "Recorded reply reused" if answer.replay else "Authenticated request answered",
+                level=logging.DEBUG if answer.replay else logging.INFO,
+                session_id=answer.session_id,
+                message_id=answer.request_message_id,
+                details=facts,
+            )
         if (
             operation is not None
             and sent != ["terms_offer"]
@@ -1682,11 +1737,22 @@ class HandshakeService:
 
     async def _answer(self, document: bytes, relays: Sequence[Relay], now: int) -> str:
         policy = self._policy
-        if policy.profile in REVERSE_PROFILES:
-            async with self._store.reverse_operations.operation() as operation:
-                answer, sent = await self._prepare_answer(document, now, operation=operation)
-        else:
-            answer, sent = await self._prepare_answer(document, now, operation=None)
+        metadata: dict[str, object] = {}
+        with suppress(Exception):  # transport context only, not application admission
+            request_context = Envelope.model_validate_json(document, strict=True)
+            metadata.update(
+                session_id=request_context.session_id,
+                request_type=request_context.message_type,
+                source="request_preparation",
+            )
+        with diagnostic_context(
+            profile=policy.profile, network=getattr(policy.network, "name", None), **metadata
+        ):
+            if policy.profile in REVERSE_PROFILES:
+                async with self._store.reverse_operations.operation() as operation:
+                    answer, sent = await self._prepare_answer(document, now, operation=operation)
+            else:
+                answer, sent = await self._prepare_answer(document, now, operation=None)
         # Relay delivery and independent unilateral supervision do not own the
         # reverse economic gate. Committed payable terms never become cleanup.
         if not answer.replay and sent == ["ack"] and self._settlement is not None:
@@ -1903,9 +1969,20 @@ class HandshakeService:
                         async for event in connection.events():
                             if self._has_work(event):  # drop floods before the queue
                                 await inbound.put(event)
-                except RelayError:
+                except RelayError as error:
                     if not unavailable:
-                        LOG.warning("relay unavailable: %s", url)
+                        LOG.warning(
+                            "relay unavailable: %s",
+                            url,
+                            extra={
+                                "event": "relay.unavailable",
+                                "facts": {
+                                    "relay": url,
+                                    "reason": error.reason,
+                                    "retry_seconds": int(delay),
+                                },
+                            },
+                        )
                     unavailable = True
                 except Exception:  # noqa: BLE001 - a hostile relay must not end reconnection
                     if not unavailable:

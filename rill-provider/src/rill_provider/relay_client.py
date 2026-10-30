@@ -56,6 +56,11 @@ _ONION_HOST = re.compile(r"[a-z2-7]{56}\.onion")
 class RelayError(RuntimeError):
     """The relay connection is unavailable; nothing about peers is implied."""
 
+    def __init__(self, message: str, *, reason: str | None = None) -> None:
+        """Carry a failure class, never an upstream exception message."""
+        super().__init__(message)
+        self.reason = reason
+
 
 def is_onion_relay(url: str) -> bool:
     """Whether ``url`` is a ws:// or wss:// relay on a v3 onion service."""
@@ -234,9 +239,9 @@ class RelayConnection:
                 # aiohttp sends proxy_headers only on its CONNECT for a wss:// target.
                 proxy_headers={ISOLATION_HEADER: isolation} if proxy is not None else None,
             )
-        except (aiohttp.ClientError, TimeoutError):
+        except (aiohttp.ClientError, TimeoutError) as error:
             await self._session.close()
-            raise RelayError("relay unavailable") from None
+            raise RelayError("relay unavailable", reason=type(error).__name__) from None
         except BaseException:  # cancellation while opening: do not leak the session
             await self._session.close()
             raise

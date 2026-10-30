@@ -31,11 +31,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from rill_core.wire.messages import Erc20ToLnTiming, LnToErc20Timing
 
+from rill_provider.diagnostics import diagnostic
 from rill_provider.evm_htlc import EvmBackendError, LockParams
 from rill_provider.evm_quote_policy import BTC_BLOCK_SECONDS, EvmQuoteContext, EvmQuotePrices
 from rill_provider.live_session_store import StaleOwnerError, StaleSwapError
 from rill_provider.lnd_invoice_decode import InvoiceRejectedError
 from rill_provider.lnd_payment_observation import LndNotSyncedError, LndUnavailableError
+from rill_provider.settlement_diagnostics import committed_transition, waiting_observation
 from rill_provider.settlement_engine import READINESS_BUDGET_SECONDS, READINESS_SYNC_DELAY
 
 if TYPE_CHECKING:
@@ -134,6 +136,7 @@ class EvmSettlementEngine:
         not the gas signer or any retained swap's committed destination.
         """
         self._store = store
+        self._diagnostic_waiting: dict[str, str] = {}
         self._htlc = htlc
         self._signer = signer
         self._assets = assets
@@ -226,6 +229,11 @@ class EvmSettlementEngine:
         # Recorded transactions first: their rebroadcasts decide whether this
         # tick may take new nonces (see ``_broadcast``).
         work = sorted(self._store.evm_settlement_work(), key=lambda w: w.state not in SENT_STATES)
+        self._diagnostic_waiting = {
+            item.session_id: self._diagnostic_waiting[item.session_id]
+            for item in work
+            if item.session_id in self._diagnostic_waiting
+        }
         for item in work:
             try:
                 state = await self._advance(item, now)
@@ -233,11 +241,24 @@ class EvmSettlementEngine:
                 raise  # a fenced/uncertain store cannot defer economic work
             except StaleSwapError:
                 continue
-            except Exception:
-                LOG.warning("EVM settlement step deferred for one swap", exc_info=True)
+            except Exception as error:  # noqa: BLE001 - one swap cannot stop other settlement
+                diagnostic(
+                    LOG,
+                    "swap.deferred",
+                    "EVM settlement step deferred for one swap",
+                    level=logging.WARNING,
+                    session_id=item.session_id,
+                    state=item.state,
+                    error_type=type(error).__name__,
+                    reason="backend_or_validation_unavailable",
+                )
                 continue
             if state != item.state:
+                self._diagnostic_waiting.pop(item.session_id, None)
                 results[item.session_id] = state
+            elif self._diagnostic_waiting.get(item.session_id) != state:
+                waiting_observation(LOG, item.session_id, state, item.terms_offer)
+                self._diagnostic_waiting[item.session_id] = state
         return results
 
     async def _broadcast(self, raw: bytes) -> None:
@@ -293,6 +314,7 @@ class EvmSettlementEngine:
             now=now,
             **fields,
         )
+        committed_transition(LOG, item.session_id, item.state, to_state, item.terms_offer, **fields)
         return to_state
 
     async def _advance(self, item: EvmSettlementItem, now: int) -> str:

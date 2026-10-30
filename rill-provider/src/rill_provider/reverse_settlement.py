@@ -48,6 +48,7 @@ from rill_provider.live_session_store import (
 )
 from rill_provider.lnd_hold_invoice import _BoundInvoiceSyncBeforeSubmissionError
 from rill_provider.lnd_payment_observation import LndNotSyncedError, LndObservationError
+from rill_provider.settlement_diagnostics import committed_transition
 from rill_provider.settlement_policy import offered_terms
 
 if TYPE_CHECKING:
@@ -359,9 +360,7 @@ class ReverseSettlement:
         A cooperative claim usually funds and settles the swap here, so without
         this the operator log stopped at FUNDING_SENT or FUNDED.
         """
-        moved = await self.advance(item, now)
-        if moved != item.state:
-            LOG.info("swap %s moved to %s", item.session_id[:16], moved)
+        await self.advance(item, now)
 
     async def advance(self, item: SettlementItem, now: int) -> str:
         """Reload after serialization, never execute a queued stale snapshot."""
@@ -708,6 +707,7 @@ class ReverseSettlement:
             now=now,
             **fields,  # type: ignore[arg-type]
         )
+        committed_transition(LOG, item.session_id, item.state, to_state, item.terms_offer, **fields)
         return to_state
 
     async def _abort(self, item: SettlementItem, terms: ContractTerms, now: int, why: str) -> str:

@@ -11,6 +11,7 @@ and the caller still applies amount, expiry, and CLTV policy.
 from __future__ import annotations
 
 import hashlib
+import logging
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -22,6 +23,7 @@ from rill_core.wire.bolt11 import require_wire_agreement
 from rill_core.wire.messages import InvoiceBinding
 
 from rill_provider._lnd_proto import lightning_pb2
+from rill_provider.diagnostics import diagnostic
 from rill_provider.lnd_payment_observation import (
     DEFAULT_DEADLINE_SECONDS,
     MAX_CERT_BYTES,
@@ -91,6 +93,15 @@ def binding_from_payreq(
         # Callers act on this module's rejection class (FAILED, "rejected"),
         # never on rill-core's, which would read as an outage and be retried.
         raise InvoiceRejectedError("invoice fields are ambiguous to BOLT11 readers") from None
+    diagnostic(
+        logging.getLogger(__name__),
+        "invoice.decoded",
+        "Invoice verified by LND",
+        payment_hash=binding.payment_hash,
+        invoice_hash=binding.bolt11_sha256,
+        amount_msat=binding.amount_msat,
+        memo=payreq.description,
+    )
     return binding
 
 

@@ -8,12 +8,14 @@ the next service run. Missing LND state never creates a dispatch grant.
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from rill_core.wire.messages import Envelope
 
 from rill_provider.live_session_store import LiveSessionStoreError
+from rill_provider.settlement_diagnostics import committed_transition
 from rill_provider.settlement_policy import offered_terms
 
 HASH_HEX_LENGTH = 64
@@ -86,6 +88,14 @@ def reconcile_payment(
         now=now,
         preimage=preimage,
         observation={"kind": "payment_settled", "payment_preimage": preimage},
+        routing_fee_msat=outcome.fee_msat,
+    )
+    committed_transition(
+        logging.getLogger(__name__),
+        session_id,
+        "PAYING",
+        "PAID",
+        item.terms_offer,
         routing_fee_msat=outcome.fee_msat,
     )
     return PaymentReconciliation(session_id, "SUCCEEDED", "PAID", state_changed=True)
