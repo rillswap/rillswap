@@ -35,7 +35,7 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, cast
 
@@ -511,10 +511,25 @@ class MailboxWork:
     mailbox_key: str
     declared_bits: int | None
     finished: bool
+    # A delivery hint, not a change to this mailbox's proof-of-work identity.
+    reserved_at: int | None = field(default=None, compare=False)
 
 
 # Terminal across every profile (forward, reverse and EVM swaps share them).
 FINISHED_SWAP_STATES = frozenset(EVM_TERMINAL_STATES)
+REPLAY_ACTIVE_SWAP_STATES = frozenset(
+    {
+        "ACCEPTED",
+        "FUNDING_SEEN",
+        "PAYING",
+        "PAID",
+        "CLAIMING",
+        "LN_HELD",
+        "FUNDING_SENT",
+        "FUNDED",
+        "REFUNDING",
+    }
+)
 
 
 def _declared_work(init_bytes: bytes) -> int | None:
@@ -7968,8 +7983,10 @@ class LiveSessionStore:
         try:
             with self._write() as connection:
                 rows = connection.execute(
-                    "SELECT s.provider_session_key, s.init_bytes, w.state FROM sessions s "
-                    "LEFT JOIN swaps w ON w.session_id = s.session_id WHERE s.blocked=0 "
+                    "SELECT s.provider_session_key, s.init_bytes, w.state, s.phase, p.reserved_at "
+                    "FROM sessions s "
+                    "LEFT JOIN swaps w ON w.session_id = s.session_id "
+                    "LEFT JOIN payment_hashes p ON p.session_id = s.session_id WHERE s.blocked=0 "
                     "AND s.phase IN ('ACCEPT_COMMITTED', 'CONFIRMED', 'ACCEPTED') "
                     "ORDER BY s.revision"
                 ).fetchall()
@@ -7978,8 +7995,13 @@ class LiveSessionStore:
         except Exception:  # noqa: BLE001 - never echo storage details
             raise LiveSessionStoreError("session mailboxes unavailable") from None
         return tuple(
-            MailboxWork(key, _declared_work(init_bytes), state in FINISHED_SWAP_STATES)
-            for key, init_bytes, state in rows
+            MailboxWork(
+                key,
+                _declared_work(init_bytes),
+                state in FINISHED_SWAP_STATES,
+                reserved_at if phase == "ACCEPTED" and state in REPLAY_ACTIVE_SWAP_STATES else None,
+            )
+            for key, init_bytes, state, phase, reserved_at in rows
         )
 
     def awaiting_confirm_mailboxes(self) -> tuple[str, ...]:
@@ -8084,13 +8106,21 @@ class LiveSessionStore:
             raise LiveSessionStoreError("capacity check refused") from None
         return bool(active < self._max_active_reservations)
 
-    def pending_outbox(self) -> tuple[OutboxEntry, ...]:
+    def pending_outbox(self, *, session_id: str | None = None) -> tuple[OutboxEntry, ...]:
         """Return committed bytes still owed to peers; current owner only."""
         try:
             with self._write() as connection:
-                rows = connection.execute(
+                query = (
                     "SELECT message_id, session_id, canonical_bytes FROM outbox "
                     "WHERE delivery_state='PENDING' ORDER BY committed_revision, message_id"
+                    if session_id is None
+                    else "SELECT message_id, session_id, canonical_bytes FROM outbox "
+                    "WHERE delivery_state='PENDING' AND session_id=? "
+                    "ORDER BY committed_revision, message_id"
+                )
+                rows = connection.execute(
+                    query,
+                    () if session_id is None else (session_id,),
                 ).fetchall()
         except LiveSessionStoreError:
             raise

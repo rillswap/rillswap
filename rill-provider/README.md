@@ -666,6 +666,19 @@ Failed relay connections log one warning per outage while retries continue
 with backoff. Once reconnection and subscription sending succeed, the provider
 logs `relay available` at INFO once. Each relay is tracked independently.
 
+Accepted unfinished swaps keep a catch-up filter anchored to their original
+firm-offer reservation, so long block waits and provider outages do not move
+the history cutoff past a backdated message. Completed and pre-economic
+mailboxes keep their bounded rolling history. Cooperative deliveries retry
+promptly inside their original deadline; retries never open another signing
+window. Relay acceptance is not counterparty acknowledgment.
+
+This delivery improvement needs no schema or configuration migration.
+Upgrading reuses existing reservations and pending outbox bytes. Missing
+reservation evidence retains the older rolling filter, never an automatic
+all-history scan. Restart still abandons unfinished signing attempts, while
+already committed contributions remain replayable under existing rules.
+
 Each relay connection attempt runs on its own Tor circuit: the CONNECT
 request carries a fresh random `X-Tor-Stream-Isolation` value, which Tor's
 default `IsolateSOCKSAuth` treats like a SOCKS user name. Connections to

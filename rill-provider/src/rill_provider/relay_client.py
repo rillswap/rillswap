@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import socket
 from contextlib import suppress
@@ -33,6 +34,8 @@ from rill_provider.tor_tunnel import (
     isolation_key,
     tunnel_established,
 )
+
+LOG = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable
@@ -208,6 +211,7 @@ class RelayConnection:
         self._events: asyncio.Queue[bytes] = asyncio.Queue(MAX_QUEUED_EVENTS)
         self._pending_ok: dict[str, asyncio.Future[bool]] = {}
         self.dropped_events = 0
+        self.subscription_closed = False
 
     async def __aenter__(self) -> Self:
         """Open the socket and start reading frames."""
@@ -254,7 +258,7 @@ class RelayConnection:
     @property
     def closed(self) -> bool:
         """Whether the socket can no longer be used."""
-        return self._socket is None or self._socket.closed
+        return self._socket is None or self._socket.closed or self.subscription_closed
 
     def _fail_pending(self) -> None:
         for future in self._pending_ok.values():
@@ -279,6 +283,9 @@ class RelayConnection:
                 if message.type != aiohttp.WSMsgType.TEXT:
                     break
                 self._dispatch(message.data)
+                if self.subscription_closed:
+                    LOG.warning("relay subscription closed; reconnect required")
+                    break
         except (aiohttp.ClientError, ConnectionError, ValueError):
             pass  # a broken or hostile relay only ends this connection
         finally:
@@ -304,6 +311,10 @@ class RelayConnection:
             future = self._pending_ok.pop(frame[1], None)
             if future is not None and not future.done():
                 future.set_result(frame[2] is True)
+        elif kind == "CLOSED" and len(frame) >= 2 and frame[1] == SUBSCRIPTION_ID:  # noqa: PLR2004
+            # A live WebSocket without its mailbox subscription is not a usable path.
+            # Do not surface the relay's arbitrary text or attempt stable-key AUTH.
+            self.subscription_closed = True
 
     async def publish(self, event: bytes, *, timeout: float = 10.0) -> bool:  # noqa: ASYNC109
         """Send one signed event; return True only on an explicit relay OK."""

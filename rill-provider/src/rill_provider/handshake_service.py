@@ -84,6 +84,8 @@ if TYPE_CHECKING:
 LOG = logging.getLogger(__name__)
 REVERSE_PROFILES = ("ln-to-btc/v1", "ln-to-erc20/v1")  # the provider funds after a hold
 NIP59_BACKDATE_SECONDS = 2 * 24 * 60 * 60
+REPLAY_CLOCK_SKEW_SECONDS = 10 * 60
+URGENT_RETRY_SECONDS = 2.0
 MAX_SEEN_EVENTS = 4096
 # A client sends its first request right after its confirm, with no answer in
 # between; relays may deliver the two in either order. Only the session's own
@@ -191,6 +193,7 @@ class ServiceHealth:
 @dataclass(slots=True)
 class _State:
     subscribed: tuple[str, ...] = ()
+    replay_groups: tuple[tuple[tuple[str, ...], int | None], ...] = ()
     work: dict[str, int] = field(default_factory=dict)  # recipient key -> required bits
     retry_subscription: bool = False
     relay_drops: dict[int, tuple[Relay, int]] = field(default_factory=dict)
@@ -203,6 +206,7 @@ class _State:
     # liquidity covers no band (nothing is announced then).
     bands: tuple[tuple[int, int], ...] = ()
     attempts: dict[str, int] = field(default_factory=dict)
+    urgent_until: dict[str, int] = field(default_factory=dict)
     seen: OrderedDict[str, None] = field(default_factory=OrderedDict)
     tip: int | None = None  # per-tick snapshot; requests never trigger RPC
     claim_fee: ClaimFeeRate | None = None  # per-tick snapshot, like the tip
@@ -381,7 +385,9 @@ class HandshakeService:
                 self._settlement.abandon_probe(session_id)
             return None
         self._readiness_probes[session_id] = challenge
+        self._state.urgent_until[challenge.request_id] = deadline_at
         if relays:
+            self._expedite_session_delivery(session_id, deadline_at)
             await self._send_pending(challenge.request_id, relays)
         return challenge.request_id
 
@@ -551,10 +557,31 @@ class HandshakeService:
         self._readiness_probes.clear()
         self._readiness_ready.clear()
 
-    async def _publish(self, event: bytes, relays: Sequence[Relay]) -> bool:
-        results = await asyncio.gather(
-            *(relay.publish(event) for relay in relays), return_exceptions=True
-        )
+    async def _publish(
+        self,
+        event: bytes,
+        relays: Sequence[Relay],
+        *,
+        budget_seconds: float | None = None,
+        before_send: Callable[[], bool] | None = None,
+    ) -> bool:
+        async def send(relay: Relay) -> bool:
+            if before_send is not None and not before_send():
+                return False
+            return await relay.publish(event)
+
+        tasks = [asyncio.create_task(send(relay)) for relay in relays]
+        try:
+            async with asyncio.timeout(budget_seconds):
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+        except TimeoutError:
+            return any(
+                task.done()
+                and not task.cancelled()
+                and task.exception() is None
+                and task.result() is True
+                for task in tasks
+            )
         return any(result is True for result in results)
 
     def _filters(self) -> list[dict[str, Any]]:
@@ -573,14 +600,92 @@ class HandshakeService:
             else:
                 work[mailbox.mailbox_key] = required if mailbox.finished else 0
         self._state.work = work
-        keys = sorted(work)
-        return [
+        # Firm terms cannot reach the client before this durable reservation. Unlike
+        # active_at, it cannot move past a message sent while the provider was offline.
+        anchors = {
+            mailbox.mailbox_key: mailbox.reserved_at
+            for mailbox in mailboxes
+            if not mailbox.finished
+            and type(mailbox.reserved_at) is int
+            and mailbox.reserved_at >= 0
+        }
+        rolling = self._now() - NIP59_BACKDATE_SECONDS - self._policy.outbox_retry
+        filters = [
             {
                 "kinds": [1059],
-                "#p": keys,
-                "since": self._now() - NIP59_BACKDATE_SECONDS - self._policy.outbox_retry,
+                "#p": sorted(set(work) - anchors.keys()),
+                "since": rolling,
             }
         ]
+        if anchors:
+            filters.append(
+                {
+                    "kinds": [1059],
+                    "#p": sorted(anchors),
+                    "since": min(
+                        rolling,
+                        min(anchors.values()) - NIP59_BACKDATE_SECONDS - REPLAY_CLOCK_SKEW_SECONDS,
+                    ),
+                }
+            )
+        return filters
+
+    def _remember_urgent(
+        self,
+        document: bytes,
+        message_id: str,
+        *,
+        session_id: str | None = None,
+    ) -> None:
+        """Scheduling only: retained bytes and their original deadline grant no authority."""
+        try:
+            payload = json.loads(document)["payload"]
+            deadline = payload.get("deadline_at")
+            if (
+                payload.get("action") in {"cooperative_claim_ready", "cooperative_claim_propose"}
+                and type(deadline) is int
+            ):
+                self._state.urgent_until[message_id] = deadline
+                if session_id is not None:
+                    self._expedite_session_delivery(session_id, deadline)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return
+
+    def _expedite_session_delivery(self, session_id: str, deadline: int) -> None:
+        """Backfill existing sequence gaps, without new delivery or financial authority."""
+        if self._deadline_now() >= deadline:
+            return
+        # Both claimants need the earlier observations before a readiness request
+        # or signed reply. Only positive PENDING evidence grants a retry duty.
+        try:
+            for entry in self._store.pending_outbox(session_id=session_id):
+                self._state.urgent_until.setdefault(entry.message_id, deadline)
+        except (TypeError, AttributeError):
+            return  # unknown delivery evidence never authorizes a broad replay
+
+    async def _retry_urgent(self, relays: Sequence[Relay]) -> None:
+        if not self._state.urgent_until:
+            return
+        now = self._deadline_now()
+        due = []
+        for message_id, deadline in tuple(self._state.urgent_until.items()):
+            if now >= deadline:
+                del self._state.urgent_until[message_id]
+            elif now >= self._state.attempts.get(message_id, 0) + URGENT_RETRY_SECONDS:
+                due.append(message_id)
+        if not due:
+            return
+        due.sort(key=lambda message_id: self._state.attempts.get(message_id, 0))
+        results = await asyncio.gather(
+            *(
+                self._send_pending(message_id, relays)
+                for message_id in due[: self._policy.max_sends_per_tick]
+            ),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, StaleOwnerError):
+                raise result
 
     def _has_work(self, event: bytes) -> bool:
         """Whether an inbound gift wrap carries the RS-006 transport work it needs.
@@ -649,11 +754,20 @@ class HandshakeService:
         if self._evm_settlement is not None:
             for session_id, moved in (await self._evm_settlement.tick(now)).items():
                 LOG.info("EVM swap %s moved to %s", session_id[:16], moved)
+        entries = self._store.pending_outbox()
+        for entry in entries:
+            self._remember_urgent(entry.canonical_bytes, entry.message_id)
         due = sorted(  # least recently attempted first (never attempted = 0)
             (
                 entry.message_id
-                for entry in self._store.pending_outbox()
-                if now >= state.attempts.get(entry.message_id, 0) + policy.outbox_retry
+                for entry in entries
+                if now
+                >= state.attempts.get(entry.message_id, 0)
+                + (
+                    URGENT_RETRY_SECONDS
+                    if now < state.urgent_until.get(entry.message_id, 0)
+                    else policy.outbox_retry
+                )
             ),
             key=lambda message_id: state.attempts.get(message_id, 0),
         )[: policy.max_sends_per_tick]  # bounded work per tick; the rest wait
@@ -680,6 +794,11 @@ class HandshakeService:
             for entry in self._store.pending_outbox()
             if entry.message_id not in self._state.attempts
         ]
+        for entry in self._store.pending_outbox():
+            if entry.message_id in fresh:
+                self._remember_urgent(
+                    entry.canonical_bytes, entry.message_id, session_id=entry.session_id
+                )
         if not fresh:
             return
         results = await asyncio.gather(
@@ -843,7 +962,12 @@ class HandshakeService:
         state.republish = True
 
     async def _resubscribe(self, relays: Sequence[Relay]) -> None:
-        wanted = tuple(self._filters()[0]["#p"])
+        filters = self._filters()
+        wanted = tuple(sorted(key for group in filters for key in group["#p"]))
+        groups = tuple(
+            (tuple(group["#p"]), group["since"] if index else None)
+            for index, group in enumerate(filters)
+        )
         # A full per-relay ingress queue drops a wrapper without closing its
         # socket. Re-REQ the same filter to replay relay history; inbox/outbox
         # admission is idempotent. Snapshot counters before REQ so another drop
@@ -860,7 +984,7 @@ class HandshakeService:
                 lost.append(relay)
         if lost:
             LOG.warning("relay inbound queue overflow; replay subscription requested")
-        refresh_all = wanted != self._state.subscribed or self._state.retry_subscription
+        refresh_all = groups != self._state.replay_groups or self._state.retry_subscription
         if refresh_all or lost:
             targets = relays if refresh_all else lost
             results = await asyncio.gather(
@@ -870,6 +994,7 @@ class HandshakeService:
                 self._state.retry_subscription = True  # retry even if the filter is empty
                 return
             self._state.subscribed = wanted
+            self._state.replay_groups = groups
             self._state.retry_subscription = False
         self._state.relay_drops = observed  # prune disconnected connection IDs
 
@@ -881,6 +1006,7 @@ class HandshakeService:
             return not requires_live or (not self._readiness_closed and self._deadline_healthy)
 
         if requires_live is None or not service_available():
+            self._state.urgent_until.pop(message_id, None)
             return
         now = self._deadline_now()
         tip: int | None = None
@@ -903,7 +1029,16 @@ class HandshakeService:
             return  # arbitration may have closed before wrapping finished
         if not service_available():
             return
-        if not await self._publish(wrap, relays):
+        urgent = self._deadline_now() < self._state.urgent_until.get(message_id, 0)
+        if not await self._publish(
+            wrap,
+            relays,
+            budget_seconds=URGENT_RETRY_SECONDS if urgent else None,
+            before_send=lambda: (
+                service_available()
+                and self._pending_sendable(message_id, tip=tip, readiness=readiness)
+            ),
+        ):
             LOG.warning("outbox wrap not accepted by any relay; will retry")
 
     def _pending_sendable(
@@ -1525,6 +1660,7 @@ class HandshakeService:
         if reply is None:
             return "proposal-replay"
         response = Envelope.model_validate_json(reply, strict=True)
+        self._remember_urgent(document, response.message_id, session_id=response.session_id)
         await self._send_pending(response.message_id, relays)
         return "proposal-signed"
 
@@ -1791,14 +1927,16 @@ class HandshakeService:
                     LOG.warning("tick refused: %s", error)  # e.g. clock behind; keep serving
                 deadline = time.monotonic() + tick_seconds
                 while not stop.is_set() and (remaining := deadline - time.monotonic()) > 0:
-                    event = await _next_or_stop(inbound, stop, remaining)
+                    event = await _next_or_stop(inbound, stop, min(remaining, URGENT_RETRY_SECONDS))
                     if event is None:
-                        break
+                        await self._retry_urgent(list(connected.values()))
+                        continue
                     if event == _RELAY_CONNECTED:
                         self._state.republish = True  # a new relay lacks our announcement
                         break
                     disposition = await self._handle_contained(event, list(connected.values()))
                     LOG.log(_disposition_level(disposition), "relay event: %s", disposition)
+                    await self._retry_urgent(list(connected.values()))
         finally:
             self._readiness_closed = True  # fence operations suspended before cleanup awaits
             for task in [*tasks, *broadcasts, *(() if deadline_task is None else (deadline_task,))]:
