@@ -138,6 +138,7 @@ export function decodeBolt11(invoice: string): DecodedInvoice {
 }
 
 interface Fields {
+  description: string | null;
   paymentHash: string | null;
   paymentSecret: string | null;
   payee: Uint8Array | null;
@@ -153,6 +154,7 @@ interface Fields {
 
 function parseFields(words: readonly number[]): Fields {
   const fields: Fields = {
+    description: null,
     paymentHash: null,
     paymentSecret: null,
     payee: null,
@@ -176,7 +178,10 @@ function parseFields(words: readonly number[]): Fields {
     index += 3 + length;
     // Private facts for the explicit metadata-bound profile only. Ordinary
     // readers keep their original policy and public decoded/binding shapes.
-    if (type === 13) fields.hasDescription = true;
+    if (type === 13) {
+      fields.hasDescription = true;
+      fields.description ??= new TextDecoder().decode(wordsToBytes(value, true));
+    }
     if (type === 23) {
       fields.metadataHashCount++;
       if (length === HASH_WORDS && fields.metadataHash === null) {
@@ -217,6 +222,13 @@ function parseFields(words: readonly number[]): Fields {
     }
   }
   return fields;
+}
+
+/** Optional authenticated display metadata only, never a signed swap binding or payment secret. */
+export function invoiceDescription(invoice: string): string | null {
+  decodeBolt11(invoice);
+  const { words } = bech32.decode(invoice as `${string}1${string}`, MAX_INVOICE_CHARS);
+  return parseFields(Array.from(words).slice(7, -SIGNATURE_WORDS)).description;
 }
 
 function authenticate(signature: Uint8Array, digest: Uint8Array, payee: Uint8Array | null): string {
