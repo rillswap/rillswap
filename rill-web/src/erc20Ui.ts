@@ -4,6 +4,7 @@
  * timelock. The injected wallet signs; this page only reads the chain.
  */
 import { type Erc20SwapOutcome, type EvmRecoveryRecord, parseEvmRecovery, type PreparedErc20Swap } from "./swap/erc20Swap";
+import { activityStatus, type ActivityObserver } from "./swap/activity";
 import {
   awaitReceipt, encodeApprove, encodeClaim, encodeLock, encodeRefund, encodeTransfer, EvmError, EvmRpc, EvmWallet, type HtlcLock, injectedProvider, type SponsoredClaimProof,
 } from "./swap/evmHtlc";
@@ -60,6 +61,7 @@ export async function connectEvmWallet(rpc: EvmRpc, asset: EvmAssetIdentity): Pr
 }
 
 export interface Erc20ExecutionOptions {
+  readonly onActivity?: ActivityObserver;
   readonly prepared: PreparedErc20Swap;
   readonly asset: EvmAssetIdentity;
   readonly rpc: EvmRpc;
@@ -115,11 +117,8 @@ export async function mountErc20Execution(panel: HTMLElement, options: Erc20Exec
       return withFundingLock(body);
     },
     ...(options.signal ? { signal: options.signal } : {}),
-    report: (line) => {
-      report(line);
-      if (line.startsWith("lock ") && line.includes("submitted")) say("Lock submitted; waiting for confirmation", 3);
-      else if (line.startsWith("lock confirmed")) say("Locked. Waiting for the provider to pay your invoice", 3);
-    },
+    report,
+    onActivity: (event) => { options.onActivity?.(event); const progress = activityStatus(event); say(progress.text, progress.step); },
     saveRecovery: async (file, stage) => {
       options.download(files, file, `rillswap-${asset.token_symbol.toLowerCase()}-to-ln-${stage}.age`);
       report(`recovery record saved (${stage})`);
@@ -332,13 +331,15 @@ export async function mountLnErc20Execution(panel: HTMLElement, options: {
   readonly journal: EvmClaimJournal; readonly status: (message: string, step: number, state?: string) => void;
   readonly report: (line: string) => void; readonly download: (root: HTMLElement, file: Uint8Array, name: string) => void;
   readonly signal?: AbortSignal;
+  readonly onActivity?: ActivityObserver;
 }): Promise<void> {
   const { prepared, rpc, claimer, journal } = options, asset = prepared.terms.evm_asset;
   const files = node("section", "", "swap-erc20-files"), invoice = node("section"), message = node("p", "Preparing durable recovery before exposing the invoice");
   panel.replaceChildren(message, invoice, files);
   let sponsored: { txHash: string; proof: SponsoredClaimProof } | null = null;
   const outcome = await prepared.execute({
-    rpc, report: (line) => { options.report(line); message.textContent = line; options.status(line, 3); },
+    rpc, report: options.report,
+    onActivity: (event) => { options.onActivity?.(event); const progress = activityStatus(event); message.textContent = progress.text; options.status(progress.text, progress.step); },
     saveRecovery: async (file, stage, contract) => {
       if (stage === "terms") await journal.create(contract, file); else await journal.save(contract, file);
       options.download(files, file, `rillswap-ln-to-${asset.token_symbol.toLowerCase()}-${stage}.age`);

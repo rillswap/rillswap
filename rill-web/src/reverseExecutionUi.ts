@@ -6,7 +6,8 @@ import { browserCosigner } from "./swap/browserCosigner";
 import { explorerTxUrl, validateMempoolApi, type NetworkName } from "./swap/config";
 import { readBoundedChainText, readChainTip, readNextBlockFeeRate } from "./swap/chainTip";
 import { quoteTiming, type TimingMarket } from "./swap/quoteTiming";
-import { notifySwap } from "./swap/notifications";
+import { notifyActivity } from "./swap/notifications";
+import { activityFacts, emitActivity, type ActivityObserver, type ActivityName, type ActivityFacts } from "./swap/activity";
 import { parseStrictEventJson } from "./strictEventJson";
 import { qrSvg } from "./qr";
 import { RecoveryFundingUnavailableError } from "./recoveryFunding";
@@ -29,6 +30,7 @@ function txLink(api: string, txid: string, label: string): HTMLAnchorElement {
 }
 
 interface ReverseProgressOptions {
+  readonly onActivity?: ActivityObserver;
   readonly network: { readonly name: NetworkName; readonly genesis_hash: string };
   readonly chainApi: string;
   readonly broadcastApi: string;
@@ -128,6 +130,16 @@ async function claimConfirmed(api: string, txid: string, network: ReverseProgres
 function drive(v: ReturnType<typeof view>, e: ClaimExecution, options: ReverseProgressOptions, signal: AbortSignal,
   flow: { readonly settlement?: () => Promise<string | null>; readonly resumed?: boolean } = {}): void {
   const { settlement, resumed = false } = flow;
+  let reference: string | undefined;
+  try { reference = e.record.context?.sessionId ?? e.record.id; } catch { /* Diagnostic identity is optional. */ }
+  const observe = (name: ActivityName, facts: ActivityFacts = {}): void => {
+    try {
+      const details = { ...activityFacts(e.terms), profile: "ln-to-btc/v1", ...(reference ? { session_id: reference } : {}), ...facts };
+      emitActivity(options.onActivity, name, details);
+      notifyActivity({ name, facts: details }, reference);
+    } catch { /* Optional diagnostic metadata cannot stop a live claim watcher. */ }
+  };
+  observe("terms.verified");
   const api = validateMempoolApi(options.chainApi, options.network.name), broadcastApi = validateMempoolApi(options.broadcastApi, options.network.name);
   const current = (): void => { signal.throwIfAborted(); options.assertCurrent(); };
   let busy = false, terminal = false, notifiedConfirmation = false;
@@ -168,7 +180,7 @@ function drive(v: ReturnType<typeof view>, e: ClaimExecution, options: ReversePr
     try {
       current(); refresh();
       if (e.record.stage === "payment-unknown") {
-        try { const file = await e.receiveFunding(10000); current(); v.backup(file); v.message.textContent = ""; notifySwap("Bitcoin is locked. Waiting for confirmations."); }
+        try { const file = await e.receiveFunding(10000); current(); v.backup(file); v.message.textContent = ""; observe("funding.received"); }
         catch { current(); v.message.textContent = "Waiting for the provider to lock the Bitcoin. Do not pay again."; return; }
         refresh();
       }
@@ -180,6 +192,7 @@ function drive(v: ReturnType<typeof view>, e: ClaimExecution, options: ReversePr
         try { depth = await e.fundingDepth(api); current(); }
         catch { current(); v.message.textContent = "Waiting for confirmation data from your mempool API."; return; }
         v.screen.querySelector("p")!.textContent = `${depth} of ${e.claimDepth} confirmations`;
+        observe("funding.depth", { confirmations: depth, required_confirmations: e.claimDepth });
         if (depth < e.claimDepth) return;
         const fee = v.fee.value.trim();
         if (!/^(0|[1-9][0-9]{0,15})$/.test(fee)) throw new Error("Invalid fee");
@@ -193,7 +206,7 @@ function drive(v: ReturnType<typeof view>, e: ClaimExecution, options: ReversePr
         const result = await e.exposeClaim(api, broadcastApi, "broadcast", current); current();
         showClaim(result.txid);
         options.status(`Claim ${result.outcome}: ${result.txid}`, 3);
-        notifySwap(result.outcome === "accepted" ? "Your Bitcoin claim was submitted." : "Your Bitcoin claim needs a manual check.");
+        observe(result.outcome === "accepted" ? "claim.submitted" : "claim.unknown", { txid: result.txid });
         if (result.outcome === "unknown") v.message.textContent = "Submission is uncertain. Checking the chain without sending again.";
       }
       if (e.record.stage === "claim-unknown" || e.record.stage === "accepted") {
@@ -209,7 +222,7 @@ function drive(v: ReturnType<typeof view>, e: ClaimExecution, options: ReversePr
           awaitingNode ? "Bitcoin received. Waiting for Lightning settlement" : "Bitcoin claim confirmed", awaitingNode ? 3 : 4);
         v.message.textContent = payment === "SUCCEEDED" ? "Swap complete." : awaitingNode
           ? "Checking your node's original payment. It will not be paid again." : "Your wallet reports the Lightning payment's settlement.";
-        if (!notifiedConfirmation) { notifySwap("Your Bitcoin claim is confirmed."); notifiedConfirmation = true; }
+        if (!notifiedConfirmation) { observe("claim.confirmed", { txid }); notifiedConfirmation = true; }
         terminal = !awaitingNode;
       } else if (e.record.stage === "terms-ready" || e.record.stage === "secrets-ready") {
         v.screen.replaceChildren(node("h2", "No payment was started here"), node("p", "This saved record cannot start or repeat a payment.")); terminal = true;
@@ -218,7 +231,7 @@ function drive(v: ReturnType<typeof view>, e: ClaimExecution, options: ReversePr
       if (!signal.aborted && error instanceof RecoveryFundingUnavailableError && (e.record.stage === "funded" || e.record.stage === "claim-ready")) {
         v.message.textContent = "Waiting for fresh Bitcoin funding data. Your saved fallback is kept.";
       } else if (!signal.aborted) { v.message.textContent = "Swap paused. Open it from Your swaps to inspect the saved state; uncertain payments and claims are never retried.";
-        notifySwap("Your swap needs attention."); terminal = true; }
+        observe("swap.attention"); terminal = true; }
     } finally { busy = false; check.disabled = signal.aborted; if (!signal.aborted) refresh(); }
   };
   check.onclick = () => { void advance(); };

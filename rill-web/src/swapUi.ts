@@ -42,7 +42,8 @@ import { mountReverseExecution, mountResumedReverseExecution } from "./reverseEx
 import { BrowserReverseJournal } from "./browserReverseJournal";
 import { resumeBrowserReverseExecution } from "./browserReverseRecovery";
 import { decryptRecoveryContainer } from "./recoveryKeys";
-import { requestSwapNotifications } from "./swap/notifications";
+import { requestSwapNotifications, notifyActivity } from "./swap/notifications";
+import { ActivityHistory, activityStatus, logText, type ActivityFacts, type ActivityObserver } from "./swap/activity";
 import { pageModuleUrl, publishedVersion } from "./publishedVersion";
 
 const NETWORKS = { mainnet, signet, testnet4, regtest } as const;
@@ -555,6 +556,9 @@ function mount(root: HTMLElement): void {
   diagnostics.append(node("summary", "Technical activity"));
   const log = node("pre", "", "swap-log");
   diagnostics.append(log);
+  const exportDiagnostics = node("button", "Download redacted diagnostics", "swap-diagnostics-export");
+  exportDiagnostics.type = "button";
+  diagnostics.append(node("p", "Local activity includes payment hashes, memos, amounts, and fees. The diagnostic download omits financial details."), exportDiagnostics);
   card.append(cardHead, form, tracking, progress, panel);
   const utilityNav = node("nav", "", "swap-utilities");
   utilityNav.setAttribute("aria-label", "Swap tools");
@@ -626,15 +630,31 @@ function mount(root: HTMLElement): void {
       item.className = index < step ? "done" : index === step ? "current" : "";
     }
   };
+  const activity = new ActivityHistory(), activityLines: string[] = [];
+  let activityContext: ActivityFacts = {};
+  const appendActivity = (line: string): void => {
+    activityLines.push(line); if (activityLines.length > 500) activityLines.shift();
+    log.textContent = activityLines.join("\n") + "\n";
+  };
+  const onActivity: ActivityObserver = (event) => {
+    activityContext = event.name === "terms.verified" ? { ...event.facts } : { ...activityContext, ...event.facts };
+    const enriched = { name: event.name, facts: activityContext };
+    const line = activity.append(enriched); if (line) appendActivity(line);
+    if (activityContext.profile !== "ln-to-btc/v1") {
+      const progress = activityStatus(event); setStatus(progress.text, progress.step);
+      notifyActivity(enriched, typeof activityContext.session_id === "string" ? activityContext.session_id : undefined);
+    }
+  };
+  exportDiagnostics.onclick = () => {
+    const file = new Blob([activity.export(commit)], { type: "application/json" }), url = URL.createObjectURL(file);
+    const link = node("a"); link.href = url; link.download = "rillswap-diagnostics.json"; link.click(); URL.revokeObjectURL(url);
+  };
   const report = (line: string): void => {
-    log.textContent += `${line}\n`;
-    if (line.startsWith("relay connected")) setStatus("Finding your provider", 0);
-    else if (line.startsWith("provider found")) setStatus("Requesting verified terms", 1);
-    else if (line.startsWith("terms:")) setStatus("Review your swap and save recovery", 1);
-    else if (line.startsWith("recovery file saved")) setStatus("Ready to fund from your wallet", 2);
-    else if (line.startsWith("funded recovery")) setStatus("Save your funded recovery backup", 2);
-    else if (line.includes("broadcast; waiting")) setStatus("Waiting for the Lightning payment", 3);
-    else if (line.startsWith("refused:") || line.startsWith("stopped:")) setStatus(line.replace(/^[^:]+: /, ""), -1, "error");
+    appendActivity(`${new Date().toISOString()} | INFO | ${logText(line, 2048)}`);
+    if (line.startsWith("refused:") || line.startsWith("stopped:")) {
+      setStatus(line.replace(/^[^:]+: /, ""), -1, "error");
+      notifyActivity({ name: "swap.attention" }, typeof activityContext.session_id === "string" ? activityContext.session_id : undefined);
+    }
   };
   let busy = false;
   const setBusy = (value: boolean): void => {
@@ -893,7 +913,7 @@ function mount(root: HTMLElement): void {
               current(); showTracking("Lightning to Bitcoin swap");
               steps.replaceChildren(...["Review", "Pay", "Locking", "Claim", "Done"].map((label) => node("li", label)));
               mountResumedReverseExecution(panel, execution, { network: { ...NETWORKS[name], name }, chainApi: api, broadcastApi: broadcast,
-                assertCurrent: current, status: (message, step) => setStatus(message, step), report,
+                assertCurrent: current, status: (message, step) => setStatus(message, step), report, onActivity,
                 download: offerDownload, saved: (file) => { publishLink(file, name); void refreshSavedRecoveries(); } });
             })().catch(() => {
               row.append(node("p", "Could not resume this saved swap. Keep any backups; no payment was retried."));
@@ -1083,7 +1103,7 @@ function mount(root: HTMLElement): void {
         showTracking(`${asset.token_symbol} to Lightning swap`);
         await mountErc20Execution(panel, {
           prepared: accepted.prepared, asset, rpc, wallet, account, ageRecipient: info.recipient, signal: cancellation.signal,
-          status: (message, step, state) => setStatus(message, step, state), report,
+          status: (message, step, state) => setStatus(message, step, state), report, onActivity,
           download: (root, file, fileName) => { offerDownload(root, file, fileName); publishLink(file, name); },
         });
       } catch (error) {
@@ -1197,7 +1217,7 @@ function mount(root: HTMLElement): void {
           btcTip: btcTip.height, evmTip: await rpc.blockNumber(), ageRecipient: info.recipient, saveSecrets: (file, sessionId) => journal.create(`secrets:${sessionId}`, file) });
         if ((await recoveryWallet.info()).fingerprint !== info.fingerprint) { prepared.dispose(); throw new Error("Recovery identity changed; request fresh terms"); }
         showTracking(`Lightning to ${asset.token_symbol} swap`);
-        await mountLnErc20Execution(panel, { prepared, rpc, claimer, journal, status: setStatus, report, signal: cancellation.signal,
+        await mountLnErc20Execution(panel, { prepared, rpc, claimer, journal, status: setStatus, report, onActivity, signal: cancellation.signal,
           download: (root, file, fileName) => { offerDownload(root, file, fileName); publishLink(file, name); } });
       } catch (error) {
         if (!cancellation.signal.aborted) { panel.append(node("p", (error as Error).message, "swap-error"), edit); report(`stopped: ${(error as Error).message}`); }
@@ -1365,7 +1385,7 @@ function mount(root: HTMLElement): void {
             await mountReverseExecution(panel, { prepared: accepted.prepared, network: { ...NETWORKS[name], name }, destinationScript, timingMarket,
               ageRecipient: info.recipient, chainApi: chainApi.value.trim(), broadcastApi: broadcastApi.value.trim(), assertCurrent,
               nodeApi: __SWAP_DEFAULTS__.network === name ? __SWAP_DEFAULTS__.nodeApi ?? "" : name === "regtest" ? "http://127.0.0.1:8093" : "",
-              status: (message, step) => setStatus(message, step), report, ...(claimDepth !== undefined ? { claimConfirmations: claimDepth } : {}),
+              status: (message, step) => setStatus(message, step), report, onActivity, ...(claimDepth !== undefined ? { claimConfirmations: claimDepth } : {}),
               download: offerDownload, saved: (file) => { publishLink(file, name); void refreshSavedRecoveries(); } });
           })().catch(() => { report("stopped: Reverse execution could not continue. Keep backups; no uncertain payment will be retried."); });
           return true;
@@ -1602,7 +1622,7 @@ function mount(root: HTMLElement): void {
         for (const quote of arrivals) if (quote !== accepted) quote.dispose();
         arrivals = [accepted];
         showTracking("Bitcoin to Lightning swap");
-        const paid = await run(accepted, name, panel, report, (file) => publishLink(file, name),
+        const paid = await run(accepted, name, panel, report, onActivity, (file) => publishLink(file, name),
           () => validateMempoolApi(chainApi.value.trim(), name), async (file) => {
             await (await walletPromise).saveFundedRecovery(name, file);
             await refreshSavedRecoveries();
@@ -1742,6 +1762,7 @@ async function run(
   networkName: NetworkName,
   panel: HTMLElement,
   report: (line: string) => void,
+  onActivity: ActivityObserver,
   publish: (file: Uint8Array) => void,
   chainApi: () => string,
   persistFunded: (file: Uint8Array) => Promise<void>,
@@ -1767,11 +1788,11 @@ async function run(
     report(`Selected provider ${quote.prepared.quote.providerIdentity} via ${quote.relayUrl}`);
     const outcome = await quote.prepared.execute({
       report,
+      onActivity,
       saveRecovery: async (file, kind) => {
         updateBackup(file, kind);
         publish(file);
         if (kind === "funded") await persistFunded(file);
-        report(kind === "terms" ? "recovery file saved to the backups list" : "funded recovery file added to the backups list");
       },
       // Showing the address can commit funds: anything sent there is the user's deposit from that moment.
       fundingSource: (funding) => {

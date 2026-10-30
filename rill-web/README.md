@@ -343,6 +343,23 @@ the receiving address; it needs no ETH. Without one, connect an injected EVM
 wallet that receives the tokens and has gas for the claim. Claim promptly: a
 failed wallet or sponsor request does not prove the preimage stayed private.
 
+## Activity and notifications
+
+Activity shows a bounded, timestamped local timeline with payment/invoice hashes,
+amounts, signed fees and optional invoice memos. Progress follows verified
+execution events, not message wording. Payment proof, cooperative completion,
+transaction submission and chain confirmation are distinct milestones.
+
+The Activity panel's **Download redacted diagnostics** exports build and milestone
+information without payment hashes, memos, amounts, session references, invoices,
+recovery data or raw exception messages. It never uploads anything. The timeline
+lives only in this page's memory and is not a recovery record.
+
+Desktop notifications use public status text and per-swap deduplication across
+the supported profiles. Permission is requested during valid swap start, never
+on page load, and denial cannot block execution. No service worker or background
+watcher is installed: keep the page open when monitoring is necessary.
+
 ## Recovery
 
 The app creates an origin-local recovery wallet. Saving its 12 words is

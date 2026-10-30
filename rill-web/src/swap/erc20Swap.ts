@@ -5,6 +5,7 @@
  * recovery record only needs the signed terms and the lock transaction.
  */
 import { schnorr } from "@noble/curves/secp256k1.js";
+import { activityFacts, emitActivity } from "./activity";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js";
 import canonicalize from "canonicalize";
@@ -293,6 +294,7 @@ export function parseEvmRecovery(plaintext: Uint8Array, network: unknown, now: n
 // Preparation and execution.
 
 export interface Erc20SwapHooks {
+  readonly onActivity?: import("./activity").ActivityObserver;
   report(line: string): void;
   saveRecovery(ciphertext: Uint8Array, stage: "terms" | "locked" | "paid"): Promise<void>;
   /** Approve the HTLC for `lock.amount` if needed and submit the lock; returns the lock tx hash. */
@@ -439,6 +441,8 @@ export async function prepareErc20Swap(
             lockTxHash: null, preimage: null, createdAt, updatedAt: createdAt,
           };
           await hooks.saveRecovery(await encryptEvmRecovery(record, request.ageRecipient), "terms");
+          emitActivity(hooks.onActivity, "terms.verified", { ...activityFacts(terms, request.invoice), session_id: session.sessionId, timelock_block: terms.htlc_timelock_block });
+          emitActivity(hooks.onActivity, "recovery.saved", { stage: "terms" });
           hooks.report("recovery record saved (terms, nothing locked yet)");
           window();
           const accepted = session.envelope("terms_accept",
@@ -457,6 +461,7 @@ export async function prepareErc20Swap(
             const locked = { ...record, updatedAt: seconds(), lockTxHash };
             await hooks.saveRecovery(await encryptEvmRecovery(locked, request.ageRecipient), "locked");
             hooks.report(`lock ${lockTxHash} submitted; recovery record saved`);
+            emitActivity(hooks.onActivity, "lock.submitted", { txid: lockTxHash });
             const receipt = await awaitReceipt(hooks.rpc, lockTxHash, terms.funding_confirmations, hooks.signal ? { signal: hooks.signal } : {});
             if (!receipt.status) throw new SwapError(`lock transaction ${lockTxHash} reverted; nothing is locked`);
             return { locked, receipt };
@@ -464,6 +469,7 @@ export async function prepareErc20Swap(
           const { locked, receipt } = await (hooks.withFundingLock ? hooks.withFundingLock(fund) : fund());
           const { lockTxHash } = locked;
           hooks.report(`lock confirmed in block ${receipt.blockNumber}; waiting for the provider to pay`);
+          emitActivity(hooks.onActivity, "lock.confirmed", { txid: lockTxHash });
           const preimage = await awaitPayment(session, hooks, { contractHash, paymentHash: invoice.payment_hash, deadline: clock() + timeouts.settleMs, timelock: terms.htlc_timelock_block, lock, htlc: asset.htlc_contract, fromBlock: receipt.blockNumber });
           const paid = { ...locked, updatedAt: seconds(), preimage };
           return { sessionId: session.sessionId, contractHash, lockTxHash, preimage, timelockBlock: terms.htlc_timelock_block,
@@ -492,6 +498,7 @@ async function awaitPayment(
     const claim = await hooks.rpc.findClaim(ctx.htlc, ctx.paymentHash, ctx.fromBlock, await hooks.rpc.blockNumber()).catch(() => null);
     if (claim !== null && proves(claim.preimage)) {
       hooks.report(`the provider claimed the lock in ${claim.txHash}; the invoice is paid`);
+      emitActivity(hooks.onActivity, "payment.verified", { txid: claim.txHash });
       return claim.preimage;
     }
     const remaining = ctx.deadline - session.clock();
@@ -514,6 +521,7 @@ async function awaitPayment(
     if (seen.kind === "payment_failed") throw new SwapError(`provider reports the payment failed; ${hint}`);
     if (seen.kind === "payment_settled" && proves(seen.payment_preimage)) {
       hooks.report("the provider paid the invoice");
+      emitActivity(hooks.onActivity, "payment.verified");
       return seen.payment_preimage;
     }
     if (seen.kind === "evm_lockup_observed") hooks.report("the provider saw the lock");

@@ -16,6 +16,7 @@
  * nothing restores signing authority after a reload.
  */
 import { schnorr } from "@noble/curves/secp256k1.js";
+import { emitActivity } from "./activity";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, concatBytes, hexToBytes } from "@noble/hashes/utils.js";
 
@@ -303,6 +304,7 @@ function providerAction(envelope: Envelope, contractHash: string): ProviderActio
 }
 
 export interface SettlementContext {
+  readonly onActivity?: import("./activity").ActivityObserver;
   readonly session: Session;
   readonly providerKey: string;
   readonly terms: BtcToLnTerms;
@@ -361,8 +363,10 @@ export async function settle(ctx: SettlementContext, refundHint: string): Promis
       throw new CooperationRefused("wrong preimage");
     }
     if (preimage !== null && preimage !== candidate) throw new CooperationRefused("conflicting preimage");
-    if (preimage === null) waitUntil = Math.min(settleDeadline, session.clock() + READY_WAIT_MS);
+    const first = preimage === null;
+    if (first) waitUntil = Math.min(settleDeadline, session.clock() + READY_WAIT_MS);
     preimage = candidate;
+    if (first) emitActivity(ctx.onActivity, "payment.verified");
   };
   const answer = async (request: Envelope, payload: Record<string, unknown>): Promise<void> => {
     const reply = session.envelope("action_result", payload, {
@@ -489,6 +493,7 @@ export async function settle(ctx: SettlementContext, refundHint: string): Promis
             });
           });
           ctx.report("cooperative claim partially signed; waiting for the provider");
+          emitActivity(ctx.onActivity, "cooperation.signing");
         } else {
           const current = proposal as { envelope: Envelope; payload: Proposal; plan: ClaimPlan } | null;
           const signed = transcript as { musig: MusigTranscript; clientNonce: Uint8Array; clientPartial: Uint8Array } | null;

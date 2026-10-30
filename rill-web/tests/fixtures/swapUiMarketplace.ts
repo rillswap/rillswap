@@ -10,6 +10,7 @@ declare global {
       reverseEvents?: string[]; reverseFunded?: boolean; reverseDepth?: number; reverseClaimConfirmed?: boolean; reverseBroadcastUnknown?: boolean; reverseNodePayment?: boolean; reverseTransientClaimRead?: boolean; reverseClaimFeeRates?: number[];
       /** Each prepared execution's claimConfirmations (null: absent, the signed depth). */
       reverseClaimConfirmations?: (number | null)[];
+      reverseDiagnosticFeeFailure?: boolean;
       fundedRecovery?: number[]; fundingPublished?: boolean;
       wallet: typeof BrowserRecoveryWallet; releaseInfo?: () => void; infoPending: boolean };
     /**
@@ -66,9 +67,11 @@ export const quoteProviders = async (_providers: unknown[], request: unknown, _s
         contractAmountSat: window.uiFixtureItemizedFees ? 1000n + BigInt(fixtureFees(index).service_fee_sat) + BigInt(fixtureFees(index).network_fee_sat) : BigInt(1100 + Number(id)),
         successFeeSat: window.uiFixtureItemizedFees ? BigInt(fixtureFees(index).service_fee_sat) + BigInt(fixtureFees(index).network_fee_sat) : 100n,
         contractHash: "0".repeat(64), refundLockHeight: 300, expiresAt: Math.floor(Date.now() / 1000) + 3600, fundingConfirmations: depths[index]! },
-      execute: async (hooks: { saveRecovery: (file: Uint8Array, stage: string) => Promise<void>; fundingSource: (request: unknown) => Promise<unknown> }) => {
+      execute: async (hooks: { onActivity?: import("../../src/swap/activity").ActivityObserver; saveRecovery: (file: Uint8Array, stage: string) => Promise<void>; fundingSource: (request: unknown) => Promise<unknown> }) => {
         window.uiFixture.executed++; window.uiFixture.executedProviders.push(id.repeat(64));
+        hooks.onActivity?.({ name: "terms.verified", facts: { profile: "btc-to-ln/v1", session_id: id.repeat(64), payment_hash: "ab".repeat(32), memo: "Fixture coffee", amount_msat: "1000000", success_fee_sat: "100" } });
         await hooks.saveRecovery(new Uint8Array([7, 7, 7]), "terms");
+        hooks.onActivity?.({ name: "recovery.saved", facts: { stage: "terms" } });
         if (window.uiFixture.fundedRecovery) {
           await hooks.saveRecovery(Uint8Array.from(window.uiFixture.fundedRecovery), "funded");
           window.uiFixture.fundingPublished = true;
@@ -117,7 +120,10 @@ export const quoteReverseProviders = async (_providers: unknown[], request: unkn
             if (!["funded", "claim-ready"].includes(record.stage) || depth >= claimDepth) throw new Error("fixture refuses");
             events.push(`lower-${depth}`); claimDepth = depth;
           },
-          get claimFeeSat() { return record.claim ? "500" : null; },
+          get claimFeeSat() {
+            if (window.uiFixture.reverseDiagnosticFeeFailure && events.includes("broadcast")) throw new Error("optional fee metadata unavailable");
+            return record.claim ? "500" : null;
+          },
           get funding() { return record.stage === "terms-ready" || record.stage === "payment-unknown" ? null : { txid: "b".repeat(64), vout: 0 }; },
           fundingDepth: async () => { events.push("depth"); return window.uiFixture.reverseDepth ?? 0; },
           accept: async () => { events.push("accept"); },

@@ -9,6 +9,7 @@
  * user's own downloads; refunds use `rill recover watch-refund --chain-only`.
  */
 import { schnorr } from "@noble/curves/secp256k1.js";
+import { activityFacts, emitActivity } from "./activity";
 import { bytesToHex, randomBytes } from "@noble/hashes/utils.js";
 
 import { invoiceBinding } from "./bolt11";
@@ -81,6 +82,7 @@ export interface FundingRequest {
 
 /** Every step that needs the user; each promise resolves once the user acted. */
 export interface SwapHooks {
+  readonly onActivity?: import("./activity").ActivityObserver;
   report(line: string): void;
   /** Offer the age file for download; resolve after the user saved it. */
   saveRecovery(file: Uint8Array, stage: "terms" | "funded"): Promise<void>;
@@ -271,6 +273,9 @@ export async function prepareSwap(
             extensions: request.refundAllocation ? { "rillswap/browser-refund-wallet": request.refundAllocation } : {},
           };
           await hooks.saveRecovery(await encryptRecovery(record, request.ageRecipient), "terms");
+          emitActivity(hooks.onActivity, "terms.verified", { ...activityFacts(terms, request.invoice), session_id: session.sessionId, refund_height: terms.refund_lock_height,
+            ...(feeBreakdown ? { service_fee_sat: feeBreakdown.service_fee_sat, network_fee_sat: feeBreakdown.network_fee_sat, fee_rate_sat_kvb: feeBreakdown.feerate_sat_kvb } : {}) });
+          emitActivity(hooks.onActivity, "recovery.saved", { stage: "terms" });
           hooks.report("recovery file saved (terms, no funding yet)");
           assertFundingWindow(terms.terms_expiry, invoice.expires_at, seconds(), checkoutExpiry);
           const accepted = session.envelope(
@@ -291,6 +296,7 @@ export async function prepareSwap(
           const bindingSignature = sign(fundingBindingHash(binding), session.secret);
           const funded = { ...record, updatedAt: seconds(), funding: [{ binding, signature: bindingSignature }] };
           await hooks.saveRecovery(await encryptRecovery(funded, request.ageRecipient), "funded");
+          emitActivity(hooks.onActivity, "recovery.saved", { stage: "funded", txid: funding.txid });
           hooks.report(`funded recovery file saved (funding ${funding.txid}, attempt ${binding.funding_attempt_id} revision 0)`);
           const bound = session.envelope(
             "funding_binding",
@@ -312,18 +318,20 @@ export async function prepareSwap(
             hooks.report(`the provider acknowledged your deposit ${funding.txid}; waiting for it to pay (${when})`);
           }
           const pendingBlocks = Math.max(0, depth - (broadcastByUser ? 0 : 1));
+          emitActivity(hooks.onActivity, "funding.acknowledged", { txid: funding.txid, required_confirmations: depth });
           const hint =
             `funds are committed; after block ${terms.refund_lock_height} open Recover a swap with the funded ` +
             `recovery file (funding attempt ${binding.funding_attempt_id}) to check funding and prepare your refund`;
           const settled = await settle(
             { session, providerKey, terms, contractHash, binding, contractSecret: contract.secret,
               tipHeight: request.tipHeight, settleMs: timeouts.settleMs + pendingBlocks * PENDING_BLOCK_WAIT_MS,
-              cosigner: hooks.cosigner, report: hooks.report },
+              cosigner: hooks.cosigner, report: hooks.report, ...(hooks.onActivity ? { onActivity: hooks.onActivity } : {}) },
             hint,
           );
           hooks.report(settled.cooperation === "verified"
             ? `cooperative key-path claim ${settled.claimTxid} verified; the provider claims privately`
             : "cooperation skipped; the provider claims with the preimage");
+          emitActivity(hooks.onActivity, settled.cooperation === "verified" ? "cooperation.verified" : "cooperation.fallback");
           const reserved = settled.reservation;
           const paid: RecoveryParts = {
             ...funded,

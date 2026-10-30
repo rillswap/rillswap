@@ -1,5 +1,6 @@
 /** RS-010 reverse swaps: indicative shopping, durable secrets, any-wallet LN payment, then an explicit EVM claim. */
 import { schnorr } from "@noble/curves/secp256k1.js";
+import { activityFacts, emitActivity } from "./activity";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js";
 import canonicalize from "canonicalize";
@@ -122,6 +123,7 @@ export interface LnErc20Configuration {
   saveSecrets(file: Uint8Array, sessionId: string): Promise<void>;
 }
 export interface LnErc20Hooks {
+  readonly onActivity?: import("./activity").ActivityObserver;
   readonly rpc: EvmRpc;
   readonly signal?: AbortSignal;
   report(line: string): void;
@@ -252,9 +254,11 @@ async function prepareFirm(relay: RelayLink, request: LnErc20Request, options: {
             const file = await encryptEvmRecovery(record, config.ageRecipient); await hooks.saveRecovery(file, stage, contractHash); return file;
           };
           await save("terms"); window();
+          emitActivity(hooks.onActivity, "terms.verified", { ...activityFacts(terms, offer.hold_invoice), session_id: session.sessionId, timelock_block: terms.htlc_timelock_block });
           const accepted = session.envelope("terms_accept", { acceptance, client_acceptance_signature: acceptanceSignature }, { inReplyTo: answer.message_id, contract: contractHash });
           await session.send(accepted, session.providerKey!, window); await session.replyTo(accepted, "ack"); window();
           hooks.showInvoice(offer.hold_invoice);
+          emitActivity(hooks.onActivity, "invoice.exposed");
           hooks.report("Pay the hold invoice from any Lightning wallet; waiting for the provider's token lock");
           const lock = lockOf(terms), deadline = clock() + 900_000;
           let funded: { txHash: string } | undefined;
@@ -267,6 +271,7 @@ async function prepareFirm(relay: RelayLink, request: LnErc20Request, options: {
             if (!funded) await new Promise((resolve) => setTimeout(resolve, 2_000));
           }
           record = { ...record, lockTxHash: funded.txHash, updatedAt: seconds() }; await save("locked");
+          emitActivity(hooks.onActivity, "lock.confirmed", { txid: funded.txHash });
           hooks.report(hooks.claimGas === "sponsored" ? "Token lock confirmed. Claiming through the gas sponsor" : "Token lock confirmed. Check and approve the claim in your EVM wallet");
           const safety = await assertSafeEvmClaim(hooks.rpc, terms, preimage, hooks.claimGas);
           await hooks.checkWallet();
@@ -274,12 +279,14 @@ async function prepareFirm(relay: RelayLink, request: LnErc20Request, options: {
           assertFreshEvmClaim(safety);
           const claimTxHash = await hooks.claim(lock, preimage, request.asset.htlc_contract);
           record = { ...record, claimTxHash, updatedAt: seconds() }; await save("claim-submitted");
+          emitActivity(hooks.onActivity, "claim.submitted", { txid: claimTxHash });
           const receipt = await awaitReceipt(hooks.rpc, claimTxHash, terms.settlement_confirmations, hooks.signal ? { signal: hooks.signal } : {});
           if (!receipt.status) throw new SwapError("Claim reverted after preimage exposure. Do not assume Lightning was refunded; inspect the chain before any retry");
           if (hooks.claimGas === "sponsored") await hooks.verifyClaim!(claimTxHash);
           // A bundled claim can be included without taking effect; the lock itself is the proof.
           if (await hooks.rpc.lockActive(request.asset.htlc_contract, lock)) throw new SwapError("Claim transaction confirmed but the token lock is still active. Inspect the chain before any retry");
           record = { ...record, updatedAt: seconds() };
+          emitActivity(hooks.onActivity, "claim.confirmed", { txid: claimTxHash });
           return { claimTxHash, recovery: await save("claimed") };
         } finally { session.secret.fill(0); }
       },
