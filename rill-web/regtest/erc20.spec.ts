@@ -6,7 +6,7 @@ import { test, expect, type Page } from "@playwright/test";
 import { execFile, execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import { assertDisposableStack, composeEnabled, run } from "./stack";
-import { EvmRpc } from "../src/swap/evmHtlc";
+import { EvmRpc, type Eip1193Provider } from "../src/swap/evmHtlc";
 import { openSettings } from "../tests/fixtures/swapPage";
 
 const root = resolve(import.meta.dirname, "../..");
@@ -34,7 +34,9 @@ async function injectWallet(page: Page): Promise<string[]> {
         if (method === "eth_requestAccounts" || method === "eth_accounts") return [account];
         if (method === "wallet_switchEthereumChain") return null;
         // Anvil runs with --base-fee 0; its eth_sendTransaction defaults would otherwise pick a priority fee above the max fee.
-        if (method === "eth_sendTransaction") params = [{ ...(params![0] as object), maxFeePerGas: "0x0", maxPriorityFeePerGas: "0x0" }];
+        // Reserve gas for state changes before inclusion: a sibling claim can empty the HTLC's token balance,
+        // making the next lock's zero-to-nonzero storage write cost more than Anvil's exact estimate.
+        if (method === "eth_sendTransaction") params = [{ gas: "0xf4240", ...(params![0] as object), maxFeePerGas: "0x0", maxPriorityFeePerGas: "0x0" }];
         const response = await fetch(rpc, { method: "POST", headers: { "content-type": "application/json" },
           body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: params ?? [] }) });
         const body = await response.json() as { result?: unknown; error?: { message: string } };
@@ -52,6 +54,25 @@ async function disableSponsor(page: Page): Promise<void> {
   for (const id of ["swap-evm-sponsor", "swap-evm-entry-point", "swap-evm-delegate"]) await page.locator(`#${id}`).fill("");
   await page.locator("#swap-settings-close").click();
 }
+
+test("the injected Anvil wallet reserves gas and preserves explicit transaction limits", async ({ page }) => {
+  test.skip(!enabled, "Explicit disposable Compose opt-in required");
+  const calls = await injectWallet(page);
+  await page.goto(`http://127.0.0.1:${webPort}/swap.html`);
+  const hashes = await page.evaluate(async (account) => {
+    const wallet = (window as unknown as { ethereum: Eip1193Provider }).ethereum;
+    const transaction = { from: account, to: account, value: "0x0" };
+    return [await wallet.request({ method: "eth_sendTransaction", params: [transaction] }),
+      await wallet.request({ method: "eth_sendTransaction", params: [{ ...transaction, gas: "0x186a0" }] })];
+  }, USER);
+  const rpc = new EvmRpc(`http://127.0.0.1:${anvilPort}`);
+  for (const [index, hash] of hashes.entries()) {
+    expect(await rpc.call("eth_getTransactionByHash", [hash])).toMatchObject({ from: USER, to: USER,
+      value: "0x0", gas: index === 0 ? "0xf4240" : "0x186a0", maxFeePerGas: "0x0", maxPriorityFeePerGas: "0x0" });
+    await expect.poll(() => rpc.call("eth_getTransactionReceipt", [hash])).toMatchObject({ status: "0x1" });
+  }
+  expect(calls.filter((method) => method === "eth_sendTransaction")).toHaveLength(2);
+});
 
 for (const direction of ["erc20-to-ln", "ln-to-erc20"] as const) {
   test(`two simultaneous browser ${direction} swaps settle independently`, async ({ context }) => {
