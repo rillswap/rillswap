@@ -211,9 +211,44 @@ Automatic provider choice ranks offers by the funding confirmations each
 provider announces (fewest first), then by price. **Provider ranking** in
 Settings switches to lowest price first. Providers that do not announce their
 confirmations rank after those that do. The manual selection list labels the
-fastest and the cheapest offer, and the Providers panel shows each
+fewest-confirmation and the cheapest offer, and the Providers panel shows each
 provider's confirmations. An offer that waits longer than its provider
-announced is refused.
+announced is refused. This ranking does not claim to select the fastest completion.
+Use **Compare quotes** to inspect every returned Bitcoin quote and choose one
+before proceeding, even when **Continue** would accept a price within the preview.
+
+Bitcoin quote comparisons show the amount paid and received, maker service
+fees or rebates, the maker's fixed mining allowance when itemized, and the
+client's claim mining fee for Lightning to Bitcoin. The allowance is paid to
+the maker, not passed through as its exact miner fee: the maker keeps savings
+and covers differences in transaction costs. Legacy quotes without a breakdown
+show a combined maker charge instead. Wallet deposit or Lightning routing fees
+remain extra, and the claim mining fee is already included in the Lightning total.
+
+Requesting Bitcoin quotes also reads public fee projections and recent blocks
+from the configured chain API (no addresses, amounts, invoices, or keys are sent).
+It never makes these reads on page load. Each quote shows a modeled chain-wait
+range in minutes when fresh data supports one. Fee bands estimate queue position;
+recent block cadence and an exponential-arrival model produce the 10th to 90th
+percentile block-time range. This is conditional on current conditions and relay
+acceptance, not a measured completion probability or a guarantee. It excludes
+user and provider processing delays.
+
+Bitcoin to Lightning estimates assume the wallet uses the API's recommended
+deposit rate and end when the funding depth allows Lightning payment. Lightning
+to Bitcoin estimates use the quoted funding-rate sample, or explicitly assume
+the API's rate if absent, then include a subsequent first claim confirmation.
+The claim estimate uses the larger script-path fallback; a key-path claim pays
+the same reserve and can be faster. Quoted funding-rate estimates use the 154 vB
+pricing model with whole-satoshi rounding when matching projected fee bands
+(0.1 sat/vB becomes 16 sat for 154 vB). Funding-rate samples are not promises about
+the eventual transaction. Stale or missing data, below-forecast rates, and
+on-demand regtest mining show no clock estimate. Zero-confirmation forward
+quotes show no confirmation wait; unconfirmed reverse packages are not modeled.
+An explicit Bitcoin to Lightning block-height override skips optional timing
+reads, preserving the existing offline/manual setup behavior.
+These estimates do not change pricing, automatic selection, confirmation risk,
+existing recovery records, or fee safety checks.
 
 **Bitcoin to Lightning.** Paste the Lightning invoice to be paid. After
 accepting the quote, send the exact amount to

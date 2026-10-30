@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
 import {
-  confirmationsLabel, fundingFeeClause, fundingWaitText, quoteSelectionLabel, signedFeeText, stoppedSwapAdvice,
+  confirmationsLabel, fundingFeeClause, fundingWaitText, makerCostText, miningAllowanceDetails, quoteSelectionLabel, signedFeeText, stoppedSwapAdvice,
 } from "../src/swapUiStatus";
+import type { FeeBreakdown } from "../src/swap/feePolicy";
 
 test("failure before sharing does not claim independently broadcast funds are uncommitted", () => {
   const advice = stoppedSwapAdvice(false);
@@ -25,7 +26,8 @@ test("manual selection does not retain the automatic best-price claim", () => {
 });
 
 test("the automatic claim names the active ranking, and manual picks claim neither", () => {
-  expect(quoteSelectionLabel(true, 3, "time")).toContain("Fastest verified provider");
+  expect(quoteSelectionLabel(true, 3, "time")).toContain("Fewest funding confirmations");
+  expect(quoteSelectionLabel(true, 3, "time")).toContain("not a fastest-completion guarantee");
   expect(quoteSelectionLabel(true, 3, "time")).not.toContain("Lowest verified");
   expect(quoteSelectionLabel(false, 3, "time")).not.toMatch(/Fastest|Lowest/);
 });
@@ -36,8 +38,8 @@ test("funding waits never present an unannounced depth as zero or one", () => {
   expect(confirmationsLabel(1)).toBe("1 confirmation");
   expect(fundingWaitText("btc-to-ln/v1", null)).toContain("did not announce");
   expect(fundingWaitText("btc-to-ln/v1", 0)).toContain("before any confirmation");
-  expect(fundingWaitText("btc-to-ln/v1", 2)).toContain("after 2 confirmations of your deposit (about 20 min)");
-  expect(fundingWaitText("ln-to-btc/v1", 1)).toBe("Payout after 1 confirmation (about 10 min).");
+  expect(fundingWaitText("btc-to-ln/v1", 2)).toBe("The provider pays after 2 confirmations of your deposit.");
+  expect(fundingWaitText("ln-to-btc/v1", 1)).toBe("Claim after 1 confirmation of funding, then wait for the claim to confirm.");
 });
 
 test("a negative provider fee is shown as a rebate of its magnitude", () => {
@@ -51,4 +53,13 @@ test("a negative provider fee is shown as a rebate of its magnitude", () => {
 test("funding instructions explain whether the amount includes a fee or reflects a rebate", () => {
   expect(fundingFeeClause(900n)).toBe("including the 900 sat provider fee");
   expect(fundingFeeClause(-100n)).toBe("after the 100 sat provider rebate");
+});
+
+test("maker service, fixed mining allowance, and unitemized legacy charges are not conflated", () => {
+  const fee = { service_fee_sat: "-100", network_fee_sat: "308", feerate_sat_kvb: "2000" } as FeeBreakdown;
+  expect(makerCostText(208n, fee)).toBe("Maker service rebate: 100 sat. Maker mining allowance: 308 sat.");
+  expect(miningAllowanceDetails(fee)).toContain("fixed charge paid to the maker, not its actual miner fee");
+  expect(miningAllowanceDetails(fee)).toContain("keeps savings and covers overruns");
+  expect(makerCostText(100n)).toBe("Maker fee: 100 sat (service and mining costs not itemized).");
+  expect(miningAllowanceDetails()).toBe("");
 });

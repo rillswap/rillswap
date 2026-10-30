@@ -20,6 +20,7 @@ import { explorerTxUrl, trustedEvmAsset, validateEvmSponsor, validateMempoolApi,
 import { ConnectionPreferences, type ConnectionSettings, type ConnectionPreferenceState } from "./connectionPreferences";
 import { GasSponsor, newStagingSecret, stagingAddress } from "./swap/gasSponsor";
 import { readChainTip, readNextBlockFeeRate } from "./swap/chainTip";
+import { quoteTiming, readTimingMarket } from "./swap/quoteTiming";
 import { BrowserRecoveryWallet, parseWalletBackup } from "./browserRecoveryWallet";
 import { type DirectoryEntry, DIRECTORY_PROFILES, discoverDirectory, discoverMarketplace, eligibleProviders, indicativeFee, ineligibilityReason, quoteProviders, quoteReverseProviders,
   estimateFromDirectory, providerLimits, type LocatedQuote, MAX_QUOTE_PROVIDERS, quoteErc20Providers, quoteLnErc20Providers, selectEvmAsset, unexpired } from "./swap/marketplace";
@@ -30,10 +31,10 @@ import { connectEvmWallet, mountErc20Execution, mountLnErc20Execution, parseToke
 import { EvmClaimJournal } from "./evmClaimJournal";
 import type { PreparedLnErc20Quote } from "./swap/lnErc20Swap";
 import type { PreparedReverseQuote, ReverseSwapRequest } from "./swap/reverseSwap";
-import type { FeeBreakdown } from "./swap/feePolicy";
+import { NETWORK_FEE_VBYTES, type FeeBreakdown } from "./swap/feePolicy";
 
 import { invoiceBinding } from "./swap/bolt11";
-import { confirmationsLabel, fundingFeeClause, fundingWaitText, quoteSelectionLabel, signedFeeText, stoppedSwapAdvice } from "./swapUiStatus";
+import { confirmationsLabel, fundingFeeClause, fundingWaitText, makerCostText, miningAllowanceDetails, quoteSelectionLabel, signedFeeText, stoppedSwapAdvice } from "./swapUiStatus";
 import { ASSETS, type AssetId, routeFor, STABLECOIN_SYMBOL } from "./swapPairs";
 import { recoveryPanel } from "./recoveryUi";
 import { parseSwapLink, swapLinkFragment } from "./swapLink";
@@ -50,8 +51,14 @@ const DIRECTORY_REFRESH_MS = 5 * 60_000;
 const SOURCE_CODE_URL = "https://github.com/rillswap/rillswap";
 
 const providerFeeDetails = (fee?: FeeBreakdown): string => fee
-  ? ` ${signedFeeText("Service", BigInt(fee.service_fee_sat), (value) => `${value} sat`)}. Network estimate: ${fee.network_fee_sat} sat (154 vB at ${Number(fee.feerate_sat_kvb) / 1000} sat/vB). Advertised outbound LN routing cap: ${fee.policy.max_routing_fee_ppm} ppm, paid by the provider.`
+  ? ` ${miningAllowanceDetails(fee)} Advertised outbound LN routing cap: ${fee.policy.max_routing_fee_ppm} ppm, paid by the provider.`
   : "";
+
+function timeDetails(text: string): HTMLDetailsElement {
+  const details = node("details");
+  details.append(node("summary", "Time estimate assumptions"), node("small", text));
+  return details;
+}
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", id?: string): HTMLElementTagNameMap[K] {
   const element = document.createElement(tag);
@@ -73,7 +80,7 @@ function field(root: HTMLElement, id: string, label: string, value = "", hint = 
 }
 
 /**
- * Manual-selection tags for each offer: its funding depth, plus "Fastest" and
+ * Manual-selection tags for each offer: its funding depth, plus "Fewest confirmations" and
  * "Cheapest" when several offers differ (one offer can carry both).
  */
 function offerTags<T>(offers: readonly T[], key: (offer: T) => Ranked): (offer: T) => HTMLElement[] {
@@ -83,7 +90,7 @@ function offerTags<T>(offers: readonly T[], key: (offer: T) => Ranked): (offer: 
   };
   return (offer) => [
     tag(confirmationsLabel(key(offer).depth), "depth"),
-    ...(offer === fastest ? [tag("Fastest", "fastest")] : []),
+    ...(offer === fastest ? [tag("Fewest confirmations", "fastest")] : []),
     ...(offer === cheapest ? [tag("Cheapest", "cheapest")] : []),
   ];
 }
@@ -209,10 +216,10 @@ function mount(root: HTMLElement): void {
   const rankingLabel = node("label", "Provider ranking");
   const ranking = node("select", "", "swap-ranking");
   rankingLabel.htmlFor = ranking.id;
-  ranking.append(Object.assign(node("option", "Fastest payment, then lowest price"), { value: "time" }),
-    Object.assign(node("option", "Lowest price, then fastest payment"), { value: "price" }));
+  ranking.append(Object.assign(node("option", "Fewest confirmations, then lowest price"), { value: "time" }),
+    Object.assign(node("option", "Lowest price, then fewest confirmations"), { value: "price" }));
   ranking.value = "time";
-  settings.append(rankingLabel, ranking, node("small", "Fastest means the fewest funding confirmations. Providers with unknown confirmation requirements rank last."));
+  settings.append(rankingLabel, ranking, node("small", "Confirmation requirements are not completion times. Compare the modeled chain waits on quotes. Providers with unknown confirmation requirements rank last."));
   const claimConfirmations = field(advancedSettings, "swap-reverse-claim-confirmations", "Lightning to Bitcoin: claim after confirmations", "",
     "Empty waits for the funding confirmations the provider signed. A lower number (0: unconfirmed) claims sooner, but the claim reveals " +
     "your payment secret: the provider can then settle your Lightning payment and still double-spend its unconfirmed or shallow " +
@@ -227,7 +234,7 @@ function mount(root: HTMLElement): void {
     return Number(value);
   };
   const sortMode = (): SortMode => ranking.value === "price" ? "price" : "time";
-  const automaticText = (): string => sortMode() === "time" ? "fastest payment, then lowest price" : "lowest price, then fastest payment";
+  const automaticText = (): string => sortMode() === "time" ? "fewest confirmations, then lowest price" : "lowest price, then fewest confirmations";
   identity.placeholder = "Automatic (by provider ranking)";
   // The provider directory: every announced provider with its limits and fees, browsable before any amount.
   const providers = node("section", "", "swap-providers");
@@ -236,7 +243,7 @@ function mount(root: HTMLElement): void {
   const closeProviders = node("button", "Close", "swap-providers-close");
   closeProviders.type = "button";
   providersHead.append(node("h2", "Providers"), closeProviders);
-  const providersIntro = node("p", "Fees and limits are what each provider announces; the signed quote is final.", "swap-providers-intro");
+  const providersIntro = node("p", "Maker pricing and limits are announced ceilings; quotes show the actual charges. Mining allowances are fixed maker charges, not actual miner fees. Claim and wallet fees are separate.", "swap-providers-intro");
   const reloadProviders = node("button", "Refresh", "swap-providers-load");
   reloadProviders.type = "button";
   const providersStatus = node("p", "", "swap-providers-status");
@@ -286,12 +293,13 @@ function mount(root: HTMLElement): void {
           ...(stablecoin ? [node("td", [...new Set(entry.evmAssets.map((asset) => asset.token_symbol))].join(", "))] : []),
           node("td", entry.amountBands.map((band) => `${BigInt(band.minimum_sat).toLocaleString()} – ${BigInt(band.maximum_sat).toLocaleString()}`).join(", ")),
           node("td", `${BigInt(fee.base_sat).toLocaleString()} sat + ${(fee.proportional_millionths / 10_000).toFixed(2)}%` +
-            (entry.feePolicy ? ` + network (up to ${Number(entry.feePolicy.max_network_feerate_sat_kvb) / 1000} sat/vB), LN cap ${entry.feePolicy.max_routing_fee_ppm} ppm` : "")),
+            (entry.feePolicy ? ` + mining allowance (up to ${((NETWORK_FEE_VBYTES * BigInt(entry.feePolicy.max_network_feerate_sat_kvb) + 999n) / 1000n).toLocaleString()} sat)` : "")),
           node("td", `${entry.feePolicy ? "up to " : ""}${indicativeFee(fee, FEE_SAMPLE, entry.feePolicy).toLocaleString()} sat`),
           node("td", entry.fundingConfirmations === null ? "unknown" : String(entry.fundingConfirmations)),
           node("td", new Date(entry.expiresAt * 1000).toLocaleString())];
         const action = node("td"); action.append(choose(entry.identity, "Choose"));
         cells.forEach((cell, index) => { cell.dataset.label = head.children[index]!.textContent ?? ""; });
+        if (entry.feePolicy) cells[stablecoin ? 3 : 2]!.title = `Allowance pricing ceiling: ${Number(entry.feePolicy.max_network_feerate_sat_kvb) / 1000} sat/vB. Not a promised mining rate.`;
         row.append(...cells, action);
         body.append(row);
       }
@@ -418,10 +426,10 @@ function mount(root: HTMLElement): void {
     const found = estimateFromDirectory(directoryEntries, route.profile, amount, identity.value.trim(), undefined, sortMode());
     if ("reason" in found) { estimate.textContent = found.reason; return; }
     estimatedTotal = amount + found.feeSat; estimatedDepth = found.fundingConfirmations;
-    estimate.replaceChildren(node("span", route.profile === "btc-to-ln/v1" ? "Estimated Bitcoin deposit" : "Estimated Lightning payment"),
+    estimate.replaceChildren(node("span", route.profile === "btc-to-ln/v1" ? "Estimated Bitcoin deposit" : "Estimated Lightning payment before claim fee"),
       node("strong", `${estimatedTotal.toLocaleString()} sat`),
       node("small", `${amount.toLocaleString()} sat ${route.profile === "btc-to-ln/v1" ? "invoice" : "received"} + ${found.feeSat.toLocaleString()} sat provider fee. ` +
-        (route.profile === "btc-to-ln/v1" ? "Your wallet's network fee is extra. " : "Your wallet's routing fee is extra. ") +
+        (route.profile === "btc-to-ln/v1" ? "Your wallet's network fee is extra. " : "The quote adds the claim mining fee. Your wallet's routing fee is extra. ") +
         fundingWaitText(route.profile, found.fundingConfirmations)));
   };
   invoice.oninput = receiveAmount.oninput = updateEstimate;
@@ -486,7 +494,10 @@ function mount(root: HTMLElement): void {
   const start = node("button", "Continue", "swap-start");
   start.type = "submit";
   start.className = "primary";
-  form.append(notice, start, keyRecommendation);
+  const compare = node("button", "Compare quotes", "swap-compare");
+  compare.type = "submit";
+  compare.className = "text-button";
+  form.append(notice, start, compare, keyRecommendation);
   // Once a swap starts, the form gives way to this tracking view; its link addresses the swap record.
   const tracking = node("div", "", "swap-tracking");
   tracking.hidden = true;
@@ -651,7 +662,8 @@ function mount(root: HTMLElement): void {
   const updateDisclosure = (): void => {
     const chain = chainApi.value.trim(), send = broadcastApi.value.trim();
     chainDisclosure.textContent = `Mempool API ${chain} sees your IP and your swap's transactions` +
-      (send === chain ? "; claims and refunds are sent there too." : `; claims and refunds are sent to ${send}.`);
+      (send === chain ? "; claims and refunds are sent there too." : `; claims and refunds are sent to ${send}.`) +
+      " Requesting quotes also fetches public fee and block data there for time estimates, without sending an address, invoice, or amount.";
     relayDisclosure.textContent = `Provider listings load from your Nostr relays when the page opens (${relay.value.trim().split(/\s+/).join(", ")}). Relays see your IP.`;
   };
   chainApi.oninput = () => { updateDisclosure(); recovery.clearFundingObservation(); };
@@ -715,6 +727,7 @@ function mount(root: HTMLElement): void {
     receiveAmount.inputMode = route.profile === "ln-to-erc20/v1" ? "decimal" : "numeric";
     start.disabled = route.unavailable !== null;
     start.textContent = route.unavailable ? "Pair unavailable" : "Continue";
+    compare.hidden = route.unavailable !== null || !["btc-to-ln/v1", "ln-to-btc/v1"].includes(route.profile ?? "");
     updateEstimate();
   };
   const changePair = (changed: HTMLSelectElement, other: HTMLSelectElement, previous: string): void => {
@@ -1166,7 +1179,7 @@ function mount(root: HTMLElement): void {
   };
 
   /** Indicative comparison first; only the selected provider can enter durable execution. */
-  const reverseQuote = (name: NetworkName): void => {
+  const reverseQuote = (name: NetworkName, compareOnly = false): void => {
     let request: Omit<ReverseSwapRequest, "identity">;
     let urls: readonly string[];
     const pinned = identity.value.trim();
@@ -1230,6 +1243,7 @@ function mount(root: HTMLElement): void {
     void (async () => {
       try {
         if (await stopForPublishedUpdate(cancellation.signal)) return;
+        const timingPromise = readTimingMarket(chainApi.value.trim(), name, { signal: cancellation.signal });
         const directory = await discoverMarketplace(urls, request.network, pinned || undefined, cancellation.signal, "ln-to-btc/v1");
         if (directory.providers.some(({ announcement }) => announcement.feePolicy)) {
           request = { ...request, networkFeeRateSatKvb: await readNextBlockFeeRate(chainApi.value.trim(), name, { signal: cancellation.signal }) };
@@ -1242,34 +1256,49 @@ function mount(root: HTMLElement): void {
         report(`Requesting up to ${MAX_QUOTE_PROVIDERS} eligible offers from ${eligible.length} announced providers`);
         const result = await quoteReverseProviders(eligible, request, cancellation.signal, mode);
         arrivals = result.quotes;
+        const timingMarket = await timingPromise;
         if (cancellation.signal.aborted) return;
         if (arrivals.length === 0) throw new Error(`No provider returned acceptable terms (${result.reasons.join("; ")}). Nothing was paid.`);
         let selected = arrivals[0]!;
         const quote = selected.prepared.quote;
         const review = node("div", "", "swap-quote-review");
-        review.append(node("p", "Estimated price", "swap-quote-kind"), node("h2", `${quote.holdInvoiceSat.toLocaleString()} sat`),
-          node("p", `You pay this over Lightning (plus your wallet's routing fee) and receive ${quote.payoutSat.toLocaleString()} sat on-chain.`),
-          node("small", `${signedFeeText("Provider", quote.successFeeSat, (value) => `${value.toLocaleString()} sat`)}. Claim fee reserve: ${quote.claimFeeReserveSat.toLocaleString()} sat. ` +
-            `${fundingWaitText("ln-to-btc/v1", quote.fundingConfirmations)} ` +
-            `If the swap fails, your Lightning payment may stay pending for up to about ${quote.incomingHtlcExpiryDeltaBlocks} blocks. ` +
-            `Estimate expires ${new Date(quote.expiresAt * 1000).toLocaleTimeString()}.`),
-          node("p", `${mode === "time" ? "Fastest" : "Lowest"} estimate among ${arrivals.length} responding provider${arrivals.length === 1 ? "" : "s"}` +
-            `${mode === "time" ? " (fewest funding confirmations, then lowest price)" : ""}.`, "swap-quote-selection"),
+        const summary = node("div", "", "swap-quote-summary"), priceClaim = node("p", "", "swap-quote-selection");
+        const timingFor = (q: PreparedReverseQuote["quote"]) => quoteTiming({ profile: "ln-to-btc/v1", fundingConfirmations: q.fundingConfirmations,
+          ...(q.feeBreakdown ? { fundingRate: Number(q.feeBreakdown.feerate_sat_kvb) / 1000 } : {}), claimFeeSat: q.claimFeeReserveSat }, timingMarket);
+        const showQuote = (): void => {
+          const q = selected.prepared.quote, timing = timingFor(q);
+          priceClaim.textContent = quoteSelectionLabel(selected === arrivals[0], arrivals.length, mode);
+          summary.replaceChildren(node("h2", `${q.holdInvoiceSat.toLocaleString()} sat`),
+            node("p", `You pay this over Lightning (plus your wallet's routing fee) and receive ${q.payoutSat.toLocaleString()} sat on-chain.`),
+            node("p", `Swap cost: ${(q.holdInvoiceSat - q.payoutSat).toLocaleString()} sat. ${makerCostText(q.successFeeSat, q.feeBreakdown)} Claim mining fee: ${q.claimFeeReserveSat.toLocaleString()} sat (included in the total).`),
+            node("p", timing.text, "swap-quote-time"), timeDetails(timing.detail),
+            node("small", `${fundingWaitText("ln-to-btc/v1", q.fundingConfirmations)} ` +
+              `If the swap fails, your Lightning payment may stay pending for up to about ${q.incomingHtlcExpiryDeltaBlocks} blocks. ` +
+              `Estimate expires ${new Date(q.expiresAt * 1000).toLocaleTimeString()}.`));
+        };
+        showQuote();
+        review.append(node("p", "Estimated price", "swap-quote-kind"), summary, priceClaim,
           node("p", "Nothing was paid and no address or payment hash was shared. Continue checks the selected provider's final signed terms before any payment.", "swap-reverse-pending"));
         if (directory.warnings.length || result.failures || eligible.length > MAX_QUOTE_PROVIDERS) {
           review.append(node("small", "Some relays or providers did not return complete results. This is not a market-wide best-price guarantee."));
         }
-        const providers = node("details"); providers.append(node("summary", "Provider details & manual selection"));
+        const providers = node("details"); providers.open = true; providers.append(node("summary", "Compare provider quotes"));
         const chosen = node("p", `Selected provider: ${selected.prepared.quote.providerIdentity}${providerFeeDetails(selected.prepared.quote.feeBreakdown)}`, "swap-reverse-selected");
         const tags = offerTags(arrivals, reverseRank);
         for (const [index, located] of arrivals.entries()) {
           const label = node("label"), option = node("input"); option.type = "radio"; option.name = "reverse-provider"; option.checked = index === 0;
+          label.className = "swap-quote-option";
           option.onchange = () => {
+            if (executing || continueSwap.disabled) return;
             selected = located;
             chosen.textContent = `Selected provider: ${located.prepared.quote.providerIdentity}. Estimated hold: ${located.prepared.quote.holdInvoiceSat} sat. ` +
               fundingWaitText("ln-to-btc/v1", located.prepared.quote.fundingConfirmations) + providerFeeDetails(located.prepared.quote.feeBreakdown);
+            showQuote();
           };
-          label.append(option, node("span", `${located.prepared.quote.holdInvoiceSat} sat · ${located.prepared.quote.providerIdentity.slice(0, 12)}…`), ...tags(located));
+          const q = located.prepared.quote, timing = timingFor(q);
+          label.append(option, node("span", `${q.holdInvoiceSat} sat · ${q.providerIdentity.slice(0, 12)}…`), ...tags(located),
+            node("small", `Swap cost: ${(q.holdInvoiceSat - q.payoutSat).toLocaleString()} sat. ${makerCostText(q.successFeeSat, q.feeBreakdown)} Claim mining fee: ${q.claimFeeReserveSat.toLocaleString()} sat.`),
+            node("small", timing.text), node("small", timing.detail.split(". ")[0]!));
           providers.append(label);
         }
         const wallet = await walletPromise; assertCurrent(); const info = await wallet.info(); assertCurrent();
@@ -1288,17 +1317,19 @@ function mount(root: HTMLElement): void {
           } catch (error) { refusal.textContent = (error as Error).message; return false; }
           refusal.textContent = "";
           destination = receiveAddress.value.trim();
+          const accepted = selected;
           continueSwap.disabled = receiveAddress.disabled = true;
+          for (const option of providers.querySelectorAll("input")) option.disabled = true;
           void (async () => {
             // The browser-stored recovery key is the approval; only an identity change blocks continuation.
             const current = await wallet.info(); assertCurrent();
             if (current.fingerprint !== info.fingerprint) throw new Error("Recovery identity changed");
             executing = true; done.disabled = true;
-            for (const quote of arrivals) if (quote !== selected) quote.dispose();
-            arrivals = [selected];
+            for (const quote of arrivals) if (quote !== accepted) quote.dispose();
+            arrivals = [accepted];
             showTracking("Lightning to Bitcoin swap");
             steps.replaceChildren(...["Review", "Pay", "Locking", "Claim", "Done"].map((label) => node("li", label)));
-            await mountReverseExecution(panel, { prepared: selected.prepared, network: { ...NETWORKS[name], name }, destinationScript,
+            await mountReverseExecution(panel, { prepared: accepted.prepared, network: { ...NETWORKS[name], name }, destinationScript, timingMarket,
               ageRecipient: info.recipient, chainApi: chainApi.value.trim(), broadcastApi: broadcastApi.value.trim(), assertCurrent,
               nodeApi: __SWAP_DEFAULTS__.network === name ? __SWAP_DEFAULTS__.nodeApi ?? "" : name === "regtest" ? "http://127.0.0.1:8093" : "",
               status: (message, step) => setStatus(message, step), report, ...(claimDepth !== undefined ? { claimConfirmations: claimDepth } : {}),
@@ -1311,7 +1342,7 @@ function mount(root: HTMLElement): void {
         review.append(providers, node("p", "By continuing you accept the provider's signed terms.", "swap-reverse-consent"),
           refusal, continueSwap, done);
         // One-step swap: a signed price no worse than the shown estimate, with the address already entered, continues directly.
-        if (withinEstimate("ln-to-btc/v1", quote.holdInvoiceSat, quote.fundingConfirmations) && receiveAddress.value.trim()) {
+        if (!compareOnly && withinEstimate("ln-to-btc/v1", quote.holdInvoiceSat, quote.fundingConfirmations) && receiveAddress.value.trim()) {
           report(`signed price ${quote.holdInvoiceSat} sat is within the shown estimate ${estimatedTotal} sat; continuing`);
           if (continueWith()) return;
         }
@@ -1332,6 +1363,7 @@ function mount(root: HTMLElement): void {
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     if (busy) return;
+    const compareOnly = event.submitter === compare;
     if (connectionState.needsReset) {
       report(`refused: ${connectionState.message}`);
       showUtility(settingsButton);
@@ -1344,7 +1376,7 @@ function mount(root: HTMLElement): void {
       return;
     }
     if (route.profile === "ln-to-btc/v1") {
-      reverseQuote(name);
+      reverseQuote(name, compareOnly);
       return;
     }
     if (route.profile === "erc20-to-ln/v1") {
@@ -1447,6 +1479,8 @@ function mount(root: HTMLElement): void {
           report(`Trusted chain API observed block ${observed.height} (${observed.hash})`);
         }
         if (cancelled) return;
+        // A manual height override also opts out of these optional public chain reads.
+        const timingPromise = automaticTip ? readTimingMarket(api, name, { signal: cancellation.signal }) : Promise.resolve(null);
         const directory = await discoverMarketplace(urls, request.network, request.identity || undefined, cancellation.signal);
         if (directory.providers.some(({ announcement }) => announcement.feePolicy)) {
           request = { ...request, networkFeeRateSatKvb: await readNextBlockFeeRate(api, name, { signal: cancellation.signal }) };
@@ -1461,18 +1495,22 @@ function mount(root: HTMLElement): void {
         report(`Requesting up to ${MAX_QUOTE_PROVIDERS} eligible offers from ${eligible.length} announced providers`);
         const result = await quoteProviders(eligible, request, cancellation.signal, mode);
         arrivals = result.quotes;
+        const timingMarket = await timingPromise;
         if (cancelled) { for (const quote of arrivals) quote.dispose(); return; }
         if (arrivals.length === 0) throw new Error(`No provider returned acceptable terms (${result.reasons.join("; ")}). Nothing was accepted or funded.`);
         let selected = arrivals[0]!;
         const review = node("div", "", "swap-quote-review");
         const quoteSummary = node("div", "", "swap-quote-summary");
         const priceClaim = node("p", "", "swap-quote-selection");
+        const timingFor = (q: LocatedQuote["prepared"]["quote"]) => quoteTiming({ profile: "btc-to-ln/v1", fundingConfirmations: q.fundingConfirmations }, timingMarket);
         const showQuote = (): void => {
           const quote = selected.prepared.quote;
+          const timing = timingFor(quote);
           priceClaim.textContent = quoteSelectionLabel(selected === arrivals[0], arrivals.length, mode);
           quoteSummary.replaceChildren(node("h2", `${quote.contractAmountSat.toLocaleString()} sat`),
-            node("p", `${signedFeeText("Provider", quote.successFeeSat, (value) => `${value.toLocaleString()} sat`)}. Your wallet's network fee is extra. ` +
-              fundingWaitText("btc-to-ln/v1", quote.fundingConfirmations) + providerFeeDetails(quote.feeBreakdown)),
+            node("p", `You receive ${BigInt(binding.amount_msat) / 1000n} sat over Lightning. ${makerCostText(quote.successFeeSat, quote.feeBreakdown)} Your wallet's deposit mining fee is extra.`),
+            node("p", timing.text, "swap-quote-time"), timeDetails(timing.detail),
+            node("small", fundingWaitText("btc-to-ln/v1", quote.fundingConfirmations) + providerFeeDetails(quote.feeBreakdown)),
             node("small", `Refund after block ${quote.refundLockHeight}. Offer expires ${new Date(quote.expiresAt * 1000).toLocaleTimeString()}.`));
         };
         showQuote();
@@ -1483,7 +1521,8 @@ function mount(root: HTMLElement): void {
           review.append(node("small", "Some relays or providers did not return complete results. This is not a market-wide best-price guarantee."));
         }
         const offers = node("details");
-        offers.append(node("summary", "Provider details & manual selection"));
+        offers.open = true;
+        offers.append(node("summary", "Compare provider quotes"));
         const tags = offerTags(arrivals, forwardRank);
         for (const [index, quote] of arrivals.entries()) {
           const label = node("label");
@@ -1491,9 +1530,13 @@ function mount(root: HTMLElement): void {
           option.type = "radio";
           option.name = "verified-provider";
           option.checked = index === 0;
+          label.className = "swap-quote-option";
           option.onchange = () => { selected = quote; showQuote(); };
+          const timing = timingFor(quote.prepared.quote);
           label.append(option, node("span", `${quote.prepared.quote.contractAmountSat} sat · ${quote.prepared.quote.providerIdentity.slice(0, 12)}…`),
-            ...tags(quote), node("small", `Transport: ${quote.relayUrl}; identity: ${quote.prepared.quote.providerIdentity}`));
+            ...tags(quote), node("small", makerCostText(quote.prepared.quote.successFeeSat, quote.prepared.quote.feeBreakdown)),
+            node("small", timing.text), node("small", timing.detail.split(". ")[0]!),
+            node("small", `Transport: ${quote.relayUrl}; identity: ${quote.prepared.quote.providerIdentity}`));
           offers.append(label);
         }
         const accept = node("button", "Use this quote", "swap-quote-accept");
@@ -1501,7 +1544,7 @@ function mount(root: HTMLElement): void {
         accept.className = "primary";
         review.append(offers, node("p", "By continuing you accept the provider's signed terms.", "swap-quote-consent"), accept, cancel);
         // One-step swap: a signed price no worse than the shown estimate is accepted without a separate review.
-        const direct = withinEstimate("btc-to-ln/v1", selected.prepared.quote.contractAmountSat, selected.prepared.quote.fundingConfirmations);
+        const direct = !compareOnly && withinEstimate("btc-to-ln/v1", selected.prepared.quote.contractAmountSat, selected.prepared.quote.fundingConfirmations);
         if (direct) report(`signed price ${selected.prepared.quote.contractAmountSat} sat is within the shown estimate ${estimatedTotal} sat; continuing`);
         else { panel.replaceChildren(review); showReview(); setStatus("Quote ready. Review before continuing", 1); }
         const accepted = direct ? selected : await new Promise<LocatedQuote | null>((resolve) => {

@@ -132,7 +132,8 @@ for (const width of [320, 390, 1440]) {
     await page.locator("#swap-start").click();
     await expect(page.locator("#swap-quote-accept")).toBeVisible();
     await expect(page.locator("#swap-form")).toBeHidden();
-    await page.locator("#swap-quote-review details summary").click();
+    await page.locator("#swap-quote-review").getByText("Time estimate assumptions", { exact: true }).click();
+    await expect(page.locator("input[name=verified-provider]").first()).toBeVisible();
     await fits(page, info, "quote");
     await page.locator("#swap-quote-accept").click();
     await expect(page.locator("#swap-funding-uri")).toBeVisible();

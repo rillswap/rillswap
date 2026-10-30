@@ -1,3 +1,5 @@
+import type { FeeBreakdown } from "./swap/feePolicy";
+
 /** A shared signed transaction can commit funds before a broadcast acknowledgment. */
 export function stoppedSwapAdvice(fundsMayBeCommitted: boolean): string {
   return fundsMayBeCommitted
@@ -12,7 +14,7 @@ export function stoppedSwapAdvice(fundsMayBeCommitted: boolean): string {
 export function quoteSelectionLabel(automatic: boolean, count: number, mode: "time" | "price"): string {
   if (!automatic) return `Manually selected provider (${count} verified offers available).`;
   return mode === "time"
-    ? `Fastest verified provider among ${count} responding offers (fewest funding confirmations, then lowest price).`
+    ? `Fewest funding confirmations among ${count} responding offers, then lowest price (not a fastest-completion guarantee).`
     : `Lowest verified provider price among ${count} responding offers.`;
 }
 
@@ -24,11 +26,23 @@ export function confirmationsLabel(depth: number | null): string {
 /** When the provider acts on the funding, in the wording of each Bitcoin direction. */
 export function fundingWaitText(profile: "btc-to-ln/v1" | "ln-to-btc/v1", depth: number | null): string {
   if (depth === null) return "The provider did not announce how many confirmations it waits for.";
-  const minutes = `about ${depth * 10} min`;
-  if (profile === "ln-to-btc/v1") return `Payout after ${confirmationsLabel(depth)} (${minutes}).`;
+  if (profile === "ln-to-btc/v1") return `Claim after ${confirmationsLabel(depth)} of funding, then wait for the claim to confirm.`;
   return depth === 0
     ? "The provider pays as soon as it sees your deposit, before any confirmation."
-    : `The provider pays after ${confirmationsLabel(depth)} of your deposit (${minutes}).`;
+    : `The provider pays after ${confirmationsLabel(depth)} of your deposit.`;
+}
+
+/** A maker's quoted mining allowance is revenue, not a pass-through of its actual miner fee. */
+export function makerCostText(total: bigint, fees?: FeeBreakdown): string {
+  const sat = (value: bigint): string => `${value.toLocaleString()} sat`;
+  return fees
+    ? `${signedFeeText("Maker service", BigInt(fees.service_fee_sat), sat)}. Maker mining allowance: ${sat(BigInt(fees.network_fee_sat))}.`
+    : `${signedFeeText("Maker", total, sat)} (service and mining costs not itemized).`;
+}
+
+export function miningAllowanceDetails(fees?: FeeBreakdown): string {
+  return fees ? `The mining allowance is a fixed charge paid to the maker, not its actual miner fee; the maker keeps savings and covers overruns. ` +
+    `Pricing model: 154 vB at ${Number(fees.feerate_sat_kvb) / 1000} sat/vB.` : "";
 }
 
 /** A negative fee is a rebate the provider pays: name it and show its magnitude. */

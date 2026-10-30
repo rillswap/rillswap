@@ -5,13 +5,14 @@ import { BrowserHoldPayer } from "./swap/browserHoldPayer";
 import { browserCosigner } from "./swap/browserCosigner";
 import { explorerTxUrl, validateMempoolApi, type NetworkName } from "./swap/config";
 import { readBoundedChainText, readChainTip, readNextBlockFeeRate } from "./swap/chainTip";
+import { quoteTiming, type TimingMarket } from "./swap/quoteTiming";
 import { notifySwap } from "./swap/notifications";
 import { parseStrictEventJson } from "./strictEventJson";
 import { qrSvg } from "./qr";
 import { RecoveryFundingUnavailableError } from "./recoveryFunding";
 import type { PreparedReverseQuote } from "./swap/reverseSwap";
 import type { PreparedReverseExecution } from "./swap/reverseExecution";
-import { signedFeeText } from "./swapUiStatus";
+import { makerCostText, miningAllowanceDetails } from "./swapUiStatus";
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", id = ""): HTMLElementTagNameMap[K] {
   const element = document.createElement(tag); element.textContent = text; if (id) element.id = id; return element;
@@ -45,6 +46,7 @@ export interface ReverseExecutionUiOptions extends ReverseProgressOptions {
   readonly nodeApi: string;
   /** Claim below the signed funding depth (0: from the mempool); absent waits for the signed depth. */
   readonly claimConfirmations?: number;
+  readonly timingMarket?: TimingMarket | null;
 }
 type ClaimExecution = Pick<PreparedReverseExecution, "terms" | "record" | "recoveryFile" | "claimFeeSat" | "claimDepth" | "lowerClaimDepth" | "funding" | "fundingDepth" | "receiveFunding" | "prepareClaim" | "exposeClaim" | "dispose">;
 
@@ -270,7 +272,13 @@ export async function mountReverseExecution(root: HTMLElement, options: ReverseE
       node("p", `Receive at least ${BigInt(terms.economics.nominal_payout_sat).toLocaleString()} sat in Bitcoin. Your wallet's routing fee is extra.`),
       node("p", "After payment, this page checks confirmations and claims your Bitcoin automatically."));
     const fees = e.feeBreakdown;
-    if (fees) v.screen.append(node("small", `${signedFeeText("Provider service", BigInt(fees.service_fee_sat), (value) => `${value} sat`)}. Provider network estimate: ${fees.network_fee_sat} sat (154 vB at ${Number(fees.feerate_sat_kvb) / 1000} sat/vB). Accept before ${new Date(terms.terms_expiry * 1000).toLocaleTimeString()}.`));
+    const timing = quoteTiming({ profile: "ln-to-btc/v1", fundingConfirmations: e.claimDepth,
+      ...(fees ? { fundingRate: Number(fees.feerate_sat_kvb) / 1000 } : {}),
+      claimFeeSat: BigInt(terms.economics.claim_fee_reserve_sat), destinationScriptBytes: options.destinationScript.length / 2 }, options.timingMarket ?? null);
+    v.screen.append(node("p", `${makerCostText(BigInt(terms.economics.success_fee_sat), fees)} Claim mining fee: ${BigInt(terms.economics.claim_fee_reserve_sat).toLocaleString()} sat (included in the Lightning total).`),
+      node("p", timing.text, "swap-reverse-time"));
+    v.advanced.append(node("small", timing.detail));
+    if (fees) v.advanced.append(node("small", `${miningAllowanceDetails(fees)} Accept before ${new Date(terms.terms_expiry * 1000).toLocaleTimeString()}.`));
     // Before any payment: the client's own lower claim depth risks a provider double-spend.
     const warning = earlyClaimWarning(e.claimDepth, terms.funding_confirmations);
     if (warning !== null) { v.screen.append(node("p", warning, "swap-reverse-early-claim")); options.report?.(`warning: ${warning}`); }

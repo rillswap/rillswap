@@ -2,6 +2,7 @@
 import { BrowserRecoveryWallet } from "../../src/browserRecoveryWallet";
 import { RecoveryFundingUnavailableError } from "../../src/recoveryFunding";
 import { forwardRank, rank, type SortMode } from "../../src/swap/ranking";
+import type { FeeBreakdown } from "../../src/swap/feePolicy";
 declare global {
   interface Window {
     uiFixture: { requests: unknown[]; executed: number; executedProviders: string[]; disposed: number;
@@ -20,9 +21,16 @@ declare global {
     uiFixtureAnnouncedDepth?: number;
     /** Signed funding depths of forward quotes "4" (1,104 sat) and "5" (1,105 sat); 1 each by default. */
     uiFixtureQuoteDepths?: [number, number];
+    uiFixtureItemizedFees?: boolean;
   }
 }
 window.uiFixture = { requests: [], executed: 0, executedProviders: [], disposed: 0, wallet: BrowserRecoveryWallet, infoPending: false };
+const fixtureFees = (index: number): FeeBreakdown => ({
+  offer_event_id: "a".repeat(64), policy: { model: "p2tr-cooperative-1in-2out/v1", base_sat: "200", proportional_millionths: 0,
+    max_network_feerate_sat_kvb: "2000", max_routing_fee_ppm: 1000 },
+  service_fee_sat: String(100 + index * 100), network_fee_sat: index === 0 ? "308" : "77", feerate_sat_kvb: index === 0 ? "2000" : "500",
+  estimated_at: Math.floor(Date.now() / 1000), issued_at: Math.floor(Date.now() / 1000),
+});
 export const MAX_QUOTE_PROVIDERS = 8;
 export const DIRECTORY_PROFILES = ["btc-to-ln/v1", "ln-to-btc/v1", "erc20-to-ln/v1", "ln-to-erc20/v1"];
 export const discoverMarketplace = async () => ({ providers: [{ announcement: {} }], warnings: [] });
@@ -50,7 +58,10 @@ export const quoteProviders = async (_providers: unknown[], request: unknown, _s
   return { failures: 0, reasons: [], quotes: rank(["4", "5"].map((id, index) => ({ relayUrl: "ws://127.0.0.1:7777/",
     dispose: () => { window.uiFixture.disposed++; },
     prepared: {
-      quote: { providerIdentity: id.repeat(64), providerSlot: "fixture", contractAmountSat: BigInt(1100 + Number(id)), successFeeSat: 100n,
+      quote: { providerIdentity: id.repeat(64), providerSlot: "fixture",
+        ...(window.uiFixtureItemizedFees ? { feeBreakdown: fixtureFees(index) } : {}),
+        contractAmountSat: window.uiFixtureItemizedFees ? 1000n + BigInt(fixtureFees(index).service_fee_sat) + BigInt(fixtureFees(index).network_fee_sat) : BigInt(1100 + Number(id)),
+        successFeeSat: window.uiFixtureItemizedFees ? BigInt(fixtureFees(index).service_fee_sat) + BigInt(fixtureFees(index).network_fee_sat) : 100n,
         contractHash: "0".repeat(64), refundLockHeight: 300, expiresAt: Math.floor(Date.now() / 1000) + 3600, fundingConfirmations: depths[index]! },
       execute: async (hooks: { saveRecovery: (file: Uint8Array, stage: string) => Promise<void>; fundingSource: (request: unknown) => Promise<unknown> }) => {
         window.uiFixture.executed++; window.uiFixture.executedProviders.push(id.repeat(64));
@@ -75,11 +86,14 @@ export const quoteProviders = async (_providers: unknown[], request: unknown, _s
 };
 export const quoteReverseProviders = async (_providers: unknown[], request: unknown) => {
   window.uiFixture.requests.push(structuredClone(request));
-  return { failures: 0, reasons: [], quotes: ["6", "7"].map((id) => ({ relayUrl: "ws://127.0.0.1:7777/",
+  return { failures: 0, reasons: [], quotes: ["6", "7"].map((id, index) => ({ relayUrl: "ws://127.0.0.1:7777/",
     dispose: () => { window.uiFixture.disposed++; },
     prepared: {
-      quote: { providerIdentity: id.repeat(64), payoutSat: 50_000n, holdInvoiceSat: BigInt(51_000 + Number(id)), successFeeSat: 500n,
-        claimFeeReserveSat: 500n, fundingConfirmations: 2, refundDelayBlocks: 144, incomingHtlcExpiryDeltaBlocks: 288, expiresAt: Math.floor(Date.now() / 1000) + 3600 },
+      quote: { providerIdentity: id.repeat(64), payoutSat: window.uiFixtureItemizedFees ? (request as { payoutSat: bigint }).payoutSat : 50_000n,
+        ...(window.uiFixtureItemizedFees ? { feeBreakdown: fixtureFees(index) } : {}),
+        holdInvoiceSat: window.uiFixtureItemizedFees ? (request as { payoutSat: bigint }).payoutSat + 143n + BigInt(fixtureFees(index).service_fee_sat) + BigInt(fixtureFees(index).network_fee_sat) : BigInt(51_000 + Number(id)),
+        successFeeSat: window.uiFixtureItemizedFees ? BigInt(fixtureFees(index).service_fee_sat) + BigInt(fixtureFees(index).network_fee_sat) : 500n,
+        claimFeeReserveSat: window.uiFixtureItemizedFees ? 143n : 500n, fundingConfirmations: 2, refundDelayBlocks: 144, incomingHtlcExpiryDeltaBlocks: 288, expiresAt: Math.floor(Date.now() / 1000) + 3600 },
       // A stand-in execution: enough for the execution UI to accept, show the invoice, and receive fixture funding.
       prepareExecution: async (configuration: { claimFeeRateSatKvb: number; claimConfirmations?: number }) => {
         (window.uiFixture.reverseClaimFeeRates ??= []).push(configuration.claimFeeRateSatKvb);

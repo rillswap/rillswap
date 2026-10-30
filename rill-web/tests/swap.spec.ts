@@ -421,7 +421,7 @@ test("the provider directory loads by itself, groups providers by swap type and 
   await openSettings(page, "connection");
   await page.locator("#swap-network").selectOption("regtest");
   await page.locator("#swap-settings-close").click();
-  await expect(page.locator("#swap-provider-choice")).toHaveText("Provider: automatic, fastest payment, then lowest price");
+  await expect(page.locator("#swap-provider-choice")).toHaveText("Provider: automatic, fewest confirmations, then lowest price");
   // Switching to regtest loads its directory without opening the dialog.
   await expect(page.locator("#swap-providers-status")).toHaveText("1 provider on regtest.");
   expect(requests).toBe(1);
@@ -452,12 +452,12 @@ test("the provider directory loads by itself, groups providers by swap type and 
   await openSettings(page, "advanced");
   await expect(page.locator("#swap-provider")).toHaveValue(identity);
   await page.locator("#swap-provider").fill("");
-  await expect(page.locator("#swap-ranking")).toHaveValue("time"); // fastest first by default
+  await expect(page.locator("#swap-ranking")).toHaveValue("time"); // fewest confirmations first by default
   await page.locator("#swap-ranking").selectOption("price");
   await page.locator("#swap-settings-close").click();
-  await expect(page.locator("#swap-provider-choice")).toHaveText("Provider: automatic, lowest price, then fastest payment");
+  await expect(page.locator("#swap-provider-choice")).toHaveText("Provider: automatic, lowest price, then fewest confirmations");
   await page.locator("#swap-providers-toggle").click();
-  await expect(page.locator("#swap-provider-automatic p")).toContainText("(lowest price, then fastest payment)");
+  await expect(page.locator("#swap-provider-automatic p")).toContainText("(lowest price, then fewest confirmations)");
 });
 
 
