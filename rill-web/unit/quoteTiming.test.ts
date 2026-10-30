@@ -19,10 +19,11 @@ test("block-clock quantiles match exponential and Erlang reference values", () =
 
 test("forward waits for the wallet deposit and required depth, not the maker's later claim", () => {
   const one = quoteTiming(forward, market, now);
-  expect(one.text).toBe("Estimated chain wait: 1 to 24 min");
+  expect(one.text).toBe("Estimated chain wait: 10 min");
+  expect(one.tooltip).toBe("Modeled range: 1 to 24 min. Not a guarantee.");
   expect(one.detail).toContain("Assumes your wallet deposits");
   expect(one.detail).toContain("not a completion guarantee");
-  expect(quoteTiming({ ...forward, fundingConfirmations: 2 }, market, now).text).toBe("Estimated chain wait: 5 to 39 min");
+  expect(quoteTiming({ ...forward, fundingConfirmations: 2 }, market, now).text).toBe("Estimated chain wait: 20 min");
   expect(quoteTiming({ ...forward, fundingRate: 0.1, claimFeeSat: 1n }, market, now)).toEqual(one);
 });
 
@@ -30,12 +31,13 @@ test("reverse waits sequentially for funding and first claim confirmation using 
   const estimate = quoteTiming(reverse, market, now);
   const expectedLow = Math.floor(blockWaitQuantile(5, 0.1, 10));
   const expectedHigh = Math.ceil(blockWaitQuantile(5, 0.9, 10));
-  expect(estimate.text).toBe(`Estimated chain wait: ${expectedLow} to ${expectedHigh} min`);
+  expect(estimate.text).toBe("Estimated chain wait: 50 min"); // k * mean interval, not the range's midpoint
+  expect(estimate.tooltip).toBe(`Modeled range: ${expectedLow} to ${expectedHigh} min. Not a guarantee.`);
   expect(estimate.detail).toContain("quoted 3 sat/vB funding estimate, not a promised");
   expect(estimate.detail).toContain("143 sat (1.00 sat/vB");
   expect(estimate.detail).toContain("first claim confirmation");
   const faster = quoteTiming({ ...reverse, fundingRate: 10, claimFeeSat: 1430n }, market, now);
-  expect(faster.text).toBe("Estimated chain wait: 5 to 39 min");
+  expect(faster.text).toBe("Estimated chain wait: 20 min");
   expect(quoteTiming({ ...reverse, destinationScriptBytes: 34 }, market, now).text).toContain("unavailable");
 });
 
@@ -49,13 +51,14 @@ test("unknown funding rates use an explicit assumption, never an advertised ceil
 test("a 0.1 sat/vB deposit model pays 16 sat for 154 vB, matching rounded projected fee bands", () => {
   const signet = { ...market, nextBlockRate: 1, projectedBlocks: [{ minimumRate: 16 / 154, vbytes: 20_000 }] };
   const estimate = quoteTiming({ ...reverse, fundingRate: 0.1 }, signet, now);
-  expect(estimate.text).toBe("Estimated chain wait: 5 to 39 min");
+  expect(estimate.text).toBe("Estimated chain wait: 20 min");
   expect(estimate.detail).toContain("quoted 0.1 sat/vB");
   expect(estimate.detail).toContain("154 vB pricing model with whole-satoshi fee rounding");
 });
 
 test("zero depth does not invent sequential confirmation waits or change the risk choice", () => {
-  expect(quoteTiming({ ...forward, fundingConfirmations: 0 }, null, now).text).toBe("Estimated chain wait: 0 min (no confirmations)");
+  expect(quoteTiming({ ...forward, fundingConfirmations: 0 }, null, now).text).toBe("Estimated chain wait: 0 min");
+  expect(quoteTiming({ ...forward, fundingConfirmations: 0 }, null, now).tooltip).toContain("No confirmation wait");
   expect(quoteTiming({ ...reverse, fundingConfirmations: 0 }, market, now).detail).toContain("package needs a separate estimate");
   expect(quoteTiming({ ...reverse, fundingConfirmations: 2 }, market, now).text).not.toBe(quoteTiming(reverse, market, now).text);
 });
@@ -111,7 +114,8 @@ test("recent cadence must be contiguous and fresh; malformed or unavailable data
 test("sparse signet projects a low-fee deposit into spare space instead of treating observed fees as a relay floor", async () => {
   const snapshot = await read(recent(), [{ blockVSize: 19_858.5, feeRange: [0.1942902458, 3917] }]).result;
   const estimate = quoteTiming({ ...reverse, fundingRate: 0.1 }, snapshot, now);
-  expect(estimate.text).toBe("Estimated chain wait: 5 to 39 min (spare-space estimate)");
+  expect(estimate.text).toBe("Estimated chain wait: 20 min");
+  expect(estimate.tooltip).toBe("Modeled range: 5 to 39 min. Not a guarantee.");
   expect(estimate.detail).toContain("fits projected spare space if the broadcasting node relays it");
   expect(estimate.detail).toContain("not a completion guarantee");
   for (const fundingRate of [0, -1, NaN, Infinity]) {
@@ -121,7 +125,7 @@ test("sparse signet projects a low-fee deposit into spare space instead of treat
 
 test("spare space can occur before the last projection; full forecasts and stacked tails do not invent a target", async () => {
   const sparse = await read(recent(), [{ blockVSize: 100, feeRange: [2, 10] }, { blockVSize: 999_000, feeRange: [1, 2] }]).result;
-  expect(quoteTiming({ ...reverse, fundingRate: 1 }, sparse, now).text).toBe("Estimated chain wait: 5 to 39 min (spare-space estimate)");
+  expect(quoteTiming({ ...reverse, fundingRate: 1 }, sparse, now).text).toBe("Estimated chain wait: 20 min");
   const stacked = await read(recent(), [{ blockVSize: 999_000, feeRange: [2, 10] }, { blockVSize: 2_000_000, feeRange: [0.1, 1] }]).result;
   expect(quoteTiming({ ...reverse, fundingRate: 1 }, stacked, now).text).toContain("unavailable");
   expect(await read(recent(), [{ blockVSize: 2_000_000, feeRange: [1] }, { blockVSize: 100, feeRange: [1] }]).result).toBeNull();
@@ -129,18 +133,25 @@ test("spare space can occur before the last projection; full forecasts and stack
 
 test("capacity estimates leave 10 kvB slack and require space for the modeled transaction", () => {
   const boundary = (vbytes: number): TimingMarket => ({ ...market, projectedBlocks: [{ minimumRate: 2, vbytes }] });
-  expect(quoteTiming({ ...reverse, fundingRate: 1, claimFeeSat: 286n }, boundary(990_000 - 154), now).text).toContain("spare-space estimate");
+  expect(quoteTiming({ ...reverse, fundingRate: 1, claimFeeSat: 286n }, boundary(990_000 - 154), now).detail).toContain("fits projected spare space");
   expect(quoteTiming({ ...reverse, fundingRate: 1, claimFeeSat: 286n }, boundary(990_000 - 153), now).text).toContain("unavailable");
 });
 
 test("the directory models both directions at recommended rates without inventing quoted claim fees or unknown depths", () => {
-  expect(directoryTiming("btc-to-ln/v1", 1, market, now).text).toBe("Estimated chain wait: 1 to 24 min");
+  expect(directoryTiming("btc-to-ln/v1", 1, market, now).text).toBe("Estimated chain wait: 10 min");
   const reverseDirectory = directoryTiming("ln-to-btc/v1", 1, market, now);
-  expect(reverseDirectory.text).toBe("Estimated chain wait: 5 to 39 min");
+  expect(reverseDirectory.text).toBe("Estimated chain wait: 20 min");
   expect(reverseDirectory.detail).toContain("No claim quote yet; assumes");
   expect(reverseDirectory.detail).not.toContain("Claim: 155 sat");
   expect(directoryTiming("btc-to-ln/v1", null, market, now).detail).toContain("has not announced");
   expect(directoryTiming("btc-to-ln/v1", 0, null, now).text).toContain("0 min");
+});
+
+test("sub-minute expected values and rounded hover bounds remain consistent", () => {
+  const estimate = quoteTiming(forward, { ...market, blockMinutes: 0.1 }, now);
+  expect(estimate.text).toBe("Estimated chain wait: <1 min");
+  expect(estimate.tooltip).toBe("Modeled range: 0 to 1 min. Not a guarantee.");
+  expect(estimate.detail).toContain("0 to 1 min (10th to 90th percentile");
 });
 
 test("regtest has no block clock, and cancellation makes no requests", async () => {

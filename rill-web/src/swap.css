@@ -140,6 +140,7 @@ details.utility-panel > summary { font-size: 1.1rem; font-weight: 650; }
 #swap-quote-summary { padding: 1rem; background: #263337; border-radius: .8rem; }
 #swap-quote-summary h2, #swap-quote-kind + h2 { color: #b6eccd; font-size: 1.7rem; }
 #swap-quote-time, #swap-reverse-time, #swap-tracking-time { font-weight: 650; color: #b6eccd; }
+.swap-time-estimate[title] { cursor: help; text-decoration: underline dotted; text-underline-offset: .2em; }
 .swap-quote-option { padding: .8rem; border: 1px solid #47605a; border-radius: .65rem; font-weight: 400; }
 .swap-quote-option:has(input:checked) { border-color: #b6eccd; background: #20382c; }
 #swap-quote-kind { margin-top: 0; }

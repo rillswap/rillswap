@@ -242,13 +242,17 @@ remain extra, and the claim mining fee is already included in the Lightning tota
 
 Opening Providers or requesting Bitcoin quotes reads public fee projections and recent blocks
 from the configured chain API (no addresses, amounts, invoices, or keys are sent).
-It never makes these reads on page load. Each quote shows a modeled chain-wait
-range in minutes when fresh data supports one. Public evidence is reused for a
-minute and scoped to its network and API. Fee bands and spare projected block
+It never makes these reads on page load. Each quote shows the expected chain wait
+in minutes when fresh data supports one. The primary number is the
+model's mean (required blocks times the recent mean block interval), rounded to
+whole minutes, not the midpoint of its range. Hover over the dotted-underlined
+time to see its modeled range; the full assumptions remain in quote details.
+Public evidence is reused for a minute and scoped to its network and API.
+Fee bands and spare projected block
 capacity estimate queue position; a low fee below current queued fees can still
 fit a sparse block if the broadcasting node relays it. The model reserves 10 kvB
-of block space for policy/coinbase slack. These capacity-based estimates are
-labeled, not treated as proof of relay or miner acceptance. The
+of block space for policy/coinbase slack. Capacity assumptions remain in quote
+details, not treated as proof of relay or miner acceptance. The
 recent block cadence and an exponential-arrival model produce the 10th to 90th
 percentile block-time range. This is conditional on current conditions and relay
 acceptance, not a measured completion probability or a guarantee. It excludes

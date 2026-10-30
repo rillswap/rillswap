@@ -315,7 +315,7 @@ function mount(root: HTMLElement): void {
         const fee = entry.indicativeFeePolicy;
         const timing = bitcoin ? directoryTiming(profile, entry.fundingConfirmations, market) : null;
         const timeCell = node("td", timingLoading ? "Loading..." : timing?.text.replace("Estimated chain wait: ", "") ?? "");
-        if (timing) timeCell.title = timing.detail;
+        if (timing) { timeCell.className = "swap-time-estimate"; timeCell.title = timing.tooltip; }
         const cells = [who,
           ...(stablecoin ? [node("td", [...new Set(entry.evmAssets.map((asset) => asset.token_symbol))].join(", "))] : []),
           node("td", entry.amountBands.map((band) => `${BigInt(band.minimum_sat).toLocaleString()} – ${BigInt(band.maximum_sat).toLocaleString()}`).join(", ")),
@@ -1298,11 +1298,12 @@ function mount(root: HTMLElement): void {
           ...(q.feeBreakdown ? { fundingRate: Number(q.feeBreakdown.feerate_sat_kvb) / 1000 } : {}), claimFeeSat: q.claimFeeReserveSat }, timingMarket);
         const showQuote = (): void => {
           const q = selected.prepared.quote, timing = timingFor(q);
+          const time = node("p", timing.text, "swap-quote-time"); time.className = "swap-time-estimate"; time.title = timing.tooltip;
           priceClaim.textContent = quoteSelectionLabel(selected === arrivals[0], arrivals.length, mode);
           summary.replaceChildren(node("h2", `${q.holdInvoiceSat.toLocaleString()} sat`),
             node("p", `You pay this over Lightning (plus your wallet's routing fee) and receive ${q.payoutSat.toLocaleString()} sat on-chain.`),
             node("p", `Swap cost: ${(q.holdInvoiceSat - q.payoutSat).toLocaleString()} sat. ${makerCostText(q.successFeeSat, q.feeBreakdown)} Claim mining fee: ${q.claimFeeReserveSat.toLocaleString()} sat (included in the total).`),
-            node("p", timing.text, "swap-quote-time"), timeDetails(timing.detail),
+            time, timeDetails(timing.detail),
             node("small", `${fundingWaitText("ln-to-btc/v1", q.fundingConfirmations)} ` +
               `If the swap fails, your Lightning payment may stay pending for up to about ${q.incomingHtlcExpiryDeltaBlocks} blocks. ` +
               `Estimate expires ${new Date(q.expiresAt * 1000).toLocaleTimeString()}.`));
@@ -1327,9 +1328,10 @@ function mount(root: HTMLElement): void {
             showQuote();
           };
           const q = located.prepared.quote, timing = timingFor(q);
+          const time = node("small", timing.text); time.className = "swap-time-estimate"; time.title = timing.tooltip;
           label.append(option, node("span", `${q.holdInvoiceSat} sat · ${q.providerIdentity.slice(0, 12)}…`), ...tags(located),
             node("small", `Swap cost: ${(q.holdInvoiceSat - q.payoutSat).toLocaleString()} sat. ${makerCostText(q.successFeeSat, q.feeBreakdown)} Claim mining fee: ${q.claimFeeReserveSat.toLocaleString()} sat.`),
-            node("small", timing.text), node("small", timing.detail.split(". ")[0]!));
+            time, node("small", timing.detail.split(". ")[0]!));
           providers.append(label);
         }
         const wallet = await walletPromise; assertCurrent(); const info = await wallet.info(); assertCurrent();
@@ -1537,10 +1539,11 @@ function mount(root: HTMLElement): void {
         const showQuote = (): void => {
           const quote = selected.prepared.quote;
           const timing = timingFor(quote);
+          const time = node("p", timing.text, "swap-quote-time"); time.className = "swap-time-estimate"; time.title = timing.tooltip;
           priceClaim.textContent = quoteSelectionLabel(selected === arrivals[0], arrivals.length, mode);
           quoteSummary.replaceChildren(node("h2", `${quote.contractAmountSat.toLocaleString()} sat`),
             node("p", `You receive ${BigInt(binding.amount_msat) / 1000n} sat over Lightning. ${makerCostText(quote.successFeeSat, quote.feeBreakdown)} Your wallet's deposit mining fee is extra.`),
-            node("p", timing.text, "swap-quote-time"), timeDetails(timing.detail),
+            time, timeDetails(timing.detail),
             node("small", fundingWaitText("btc-to-ln/v1", quote.fundingConfirmations) + providerFeeDetails(quote.feeBreakdown)),
             node("small", `Refund after block ${quote.refundLockHeight}. Offer expires ${new Date(quote.expiresAt * 1000).toLocaleTimeString()}.`));
         };
@@ -1564,9 +1567,10 @@ function mount(root: HTMLElement): void {
           label.className = "swap-quote-option";
           option.onchange = () => { selected = quote; showQuote(); };
           const timing = timingFor(quote.prepared.quote);
+          const time = node("small", timing.text); time.className = "swap-time-estimate"; time.title = timing.tooltip;
           label.append(option, node("span", `${quote.prepared.quote.contractAmountSat} sat · ${quote.prepared.quote.providerIdentity.slice(0, 12)}…`),
             ...tags(quote), node("small", makerCostText(quote.prepared.quote.successFeeSat, quote.prepared.quote.feeBreakdown)),
-            node("small", timing.text), node("small", timing.detail.split(". ")[0]!),
+            time, node("small", timing.detail.split(". ")[0]!),
             node("small", `Transport: ${quote.relayUrl}; identity: ${quote.prepared.quote.providerIdentity}`));
           offers.append(label);
         }
@@ -1756,7 +1760,7 @@ async function run(
     backups.hidden = false;
   };
   const stage = node("div", "", "swap-stage");
-  const initialWait = node("p", timing.text, "swap-tracking-time"); initialWait.title = timing.detail;
+  const initialWait = node("p", timing.text, "swap-tracking-time"); initialWait.className = "swap-time-estimate"; initialWait.title = timing.tooltip;
   panel.replaceChildren(stage, backups);
   panel = stage;
   try {

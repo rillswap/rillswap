@@ -275,8 +275,9 @@ export async function mountReverseExecution(root: HTMLElement, options: ReverseE
     const timing = quoteTiming({ profile: "ln-to-btc/v1", fundingConfirmations: e.claimDepth,
       ...(fees ? { fundingRate: Number(fees.feerate_sat_kvb) / 1000 } : {}),
       claimFeeSat: BigInt(terms.economics.claim_fee_reserve_sat), destinationScriptBytes: options.destinationScript.length / 2 }, options.timingMarket ?? null);
+    const time = node("p", timing.text, "swap-reverse-time"); time.className = "swap-time-estimate"; time.title = timing.tooltip;
     v.screen.append(node("p", `${makerCostText(BigInt(terms.economics.success_fee_sat), fees)} Claim mining fee: ${BigInt(terms.economics.claim_fee_reserve_sat).toLocaleString()} sat (included in the Lightning total).`),
-      node("p", timing.text, "swap-reverse-time"));
+      time);
     v.advanced.append(node("small", timing.detail));
     if (fees) v.advanced.append(node("small", `${miningAllowanceDetails(fees)} Accept before ${new Date(terms.terms_expiry * 1000).toLocaleTimeString()}.`));
     // Before any payment: the client's own lower claim depth risks a provider double-spend.

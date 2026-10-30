@@ -24,6 +24,7 @@ export interface QuoteTimingInput {
 
 export interface QuoteTiming {
   readonly text: string;
+  readonly tooltip: string;
   readonly detail: string;
 }
 
@@ -101,11 +102,11 @@ export function blockWaitQuantile(blocks: number, probability: number, blockMinu
 
 /** Fee bands are a queue-position heuristic, not measured inclusion probabilities. */
 export function quoteTiming(input: QuoteTimingInput, market: TimingMarket | null, now = Date.now()): QuoteTiming {
-  const unavailable = (detail: string): QuoteTiming => ({ text: "Time estimate unavailable", detail });
+  const unavailable = (detail: string): QuoteTiming => ({ text: "Time estimate unavailable", tooltip: detail, detail });
   const depth = input.fundingConfirmations;
   if (!Number.isSafeInteger(depth) || depth < 0 || depth > MAX_BLOCKS) return unavailable("Confirmation requirement unavailable.");
   if (depth === 0) return input.profile === "btc-to-ln/v1"
-    ? { text: "Estimated chain wait: 0 min (no confirmations)", detail: "Payment starts when the provider sees the deposit; provider processing time is unknown." }
+    ? { text: "Estimated chain wait: 0 min", tooltip: "No confirmation wait. Provider processing time is unknown.", detail: "Payment starts when the provider sees the deposit; provider processing time is unknown." }
     : unavailable("An unconfirmed funding and claim package needs a separate estimate; early claiming increases double-spend risk.");
   if (!market || now < market.observedAt || now - market.observedAt > MAX_AGE_MS) return unavailable("Fresh public fee-queue and block data are unavailable.");
   const target = (rate: number, vbytes: number): { blocks: number; spareSpace: boolean } | null => {
@@ -145,12 +146,16 @@ export function quoteTiming(input: QuoteTimingInput, market: TimingMarket | null
     if (input.claimFeeSat !== undefined && input.destinationScriptBytes === undefined) rates += " Assumes a P2TR destination until final terms bind your address.";
   }
   if (blocks > MAX_BLOCKS) return unavailable("The confirmation wait exceeds the supported forecast.");
-  const low = Math.max(1, Math.floor(blockWaitQuantile(blocks, 0.1, market.blockMinutes)));
+  const low = Math.max(0, Math.floor(blockWaitQuantile(blocks, 0.1, market.blockMinutes)));
   const high = Math.max(low + 1, Math.ceil(blockWaitQuantile(blocks, 0.9, market.blockMinutes)));
+  // The Erlang expectation is k * mean block interval, not the midpoint of its range.
+  const meanMinutes = blocks * market.blockMinutes;
+  const expected = meanMinutes < 1 ? "<1" : Math.round(meanMinutes).toLocaleString();
   return {
-    text: `Estimated chain wait: ${low} to ${high} min${spareSpace ? " (spare-space estimate)" : ""}`,
+    text: `Estimated chain wait: ${expected} min`,
+    tooltip: `Modeled range: ${low} to ${high} min. Not a guarantee.`,
     detail: `${rates} ${input.profile === "ln-to-btc/v1" ? "Through the first claim confirmation." : "Until the deposit depth allows Lightning payment."} ` +
-      `Modeled 10th to 90th percentile block-time range, using recent ${market.blockMinutes.toFixed(1)} min blocks and today's fee queue. ` +
+      `Modeled range: ${low} to ${high} min (10th to 90th percentile block times), using recent ${market.blockMinutes.toFixed(1)} min blocks and today's fee queue. ` +
       (spareSpace ? "A rate is below the lowest queued fee, but fits projected spare space if the broadcasting node relays it. " : "") +
       "Assumes transactions relay and current conditions hold; not a completion guarantee. Excludes your payment/signing time and provider processing." +
       (input.profile === "ln-to-btc/v1" ? " Key-path claims can be faster." : ""),
@@ -159,6 +164,9 @@ export function quoteTiming(input: QuoteTimingInput, market: TimingMarket | null
 
 /** Before quotes, compare the announced depth under the same explicit rate assumptions. */
 export function directoryTiming(profile: QuoteTimingInput["profile"], depth: number | null, market: TimingMarket | null, now = Date.now()): QuoteTiming {
-  if (depth === null) return { text: "Time estimate unavailable", detail: "The provider has not announced its confirmation requirement." };
+  if (depth === null) {
+    const detail = "The provider has not announced its confirmation requirement.";
+    return { text: "Time estimate unavailable", tooltip: detail, detail };
+  }
   return quoteTiming({ profile, fundingConfirmations: depth, ...(market ? { claimRate: market.nextBlockRate } : {}) }, market, now);
 }

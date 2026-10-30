@@ -369,8 +369,10 @@ test("reverse quotes show separate maker and mining charges with fee-aware minut
   await expect(summary).toContainText("Maker service fee: 100 sat");
   await expect(summary).toContainText("Maker mining allowance: 308 sat");
   await expect(summary).toContainText("Claim mining fee: 143 sat (included in the total)");
-  await expect(offers.nth(0)).toContainText("Estimated chain wait: 17 to 67 min");
-  await expect(offers.nth(1)).toContainText("Estimated chain wait: 24 to 80 min");
+  await expect(offers.nth(0)).toContainText("Estimated chain wait: 40 min");
+  await expect(offers.nth(1)).toContainText("Estimated chain wait: 50 min");
+  await expect(offers.nth(0).locator(".swap-time-estimate")).toHaveAttribute("title", "Modeled range: 17 to 67 min. Not a guarantee.");
+  await expect(offers.nth(1).locator(".swap-time-estimate")).toHaveAttribute("title", "Modeled range: 24 to 80 min. Not a guarantee.");
   await expect(offers.nth(0)).toContainText("not a promised transaction rate");
   await expect(page.locator("#swap-reverse-selected")).toContainText("maker keeps savings and covers overruns");
   expect(requests).toHaveLength(3);
@@ -382,7 +384,8 @@ test("reverse quotes show separate maker and mining charges with fee-aware minut
   await expect(summary).toContainText("Swap cost: 420 sat");
   await expect(summary).toContainText("Maker service fee: 200 sat");
   await expect(summary).toContainText("Maker mining allowance: 77 sat");
-  await expect(page.locator("#swap-quote-time")).toHaveText("Estimated chain wait: 24 to 80 min");
+  await expect(page.locator("#swap-quote-time")).toHaveText("Estimated chain wait: 50 min");
+  await expect(page.locator("#swap-quote-time")).toHaveAttribute("title", "Modeled range: 24 to 80 min. Not a guarantee.");
   await expect(page.locator("#swap-quote-selection")).toContainText("Manually selected");
   expect(await page.evaluate(() => window.uiFixture.disposed)).toBe(0);
 });
@@ -394,12 +397,14 @@ test("forward quote minutes model the deposit depth and disclose the assumed wal
   await page.locator("#swap-invoice").fill(testInvoice("timing", "1000000", now, now + 7200, "tbs"));
   await page.locator("#swap-start").click();
   const offers = page.locator("label:has(input[name=verified-provider])");
-  await expect(offers.nth(0)).toContainText("Estimated chain wait: 1 to 24 min");
-  await expect(offers.nth(1)).toContainText("Estimated chain wait: 11 to 54 min");
+  await expect(offers.nth(0)).toContainText("Estimated chain wait: 10 min");
+  await expect(offers.nth(1)).toContainText("Estimated chain wait: 30 min");
+  await expect(offers.nth(0).locator(".swap-time-estimate")).toHaveAttribute("title", "Modeled range: 1 to 24 min. Not a guarantee.");
   await expect(offers.nth(0)).toContainText("Assumes your wallet deposits at the API's recommended 3 sat/vB");
   await expect(page.locator("#swap-quote-summary")).toContainText("deposit mining fee is extra");
   await offers.nth(1).locator("input").check();
-  await expect(page.locator("#swap-quote-time")).toHaveText("Estimated chain wait: 11 to 54 min");
+  await expect(page.locator("#swap-quote-time")).toHaveText("Estimated chain wait: 30 min");
+  await expect(page.locator("#swap-quote-time")).toHaveAttribute("title", "Modeled range: 11 to 54 min. Not a guarantee.");
 });
 
 test("unavailable advisory timing data does not block an otherwise acceptable reverse quote", async ({ page }) => {
@@ -462,7 +467,8 @@ test("a low-fee signet quote gets a conditional numeric wait when the projected 
   await page.getByRole("button", { name: "Switch direction" }).click();
   await page.locator("#swap-receive-amount").fill("61000");
   await page.locator("#swap-compare").click();
-  await expect(page.locator("#swap-quote-time")).toHaveText("Estimated chain wait: 11 to 54 min (spare-space estimate)");
+  await expect(page.locator("#swap-quote-time")).toHaveText("Estimated chain wait: 30 min");
+  await expect(page.locator("#swap-quote-time")).toHaveAttribute("title", "Modeled range: 11 to 54 min. Not a guarantee.");
   await expect(page.locator("#swap-quote-summary")).toContainText("Maker mining allowance: 16 sat");
   await page.locator("#swap-quote-summary").getByText("Time estimate assumptions", { exact: true }).click();
   await expect(page.locator("#swap-quote-summary")).toContainText("if the broadcasting node relays it");
@@ -476,15 +482,18 @@ for (const width of [320, 390, 1440]) {
     await page.locator("#swap-providers-toggle").click();
     const forwardTime = page.locator('.swap-provider-group[data-profile="btc-to-ln/v1"] td[data-label="Est. time"]');
     const reverseTime = page.locator('.swap-provider-group[data-profile="ln-to-btc/v1"] td[data-label="Est. time"]');
-    await expect(forwardTime).toHaveText("1 to 24 min");
-    await expect(reverseTime).toHaveText("5 to 39 min");
-    await expect(reverseTime).toHaveAttribute("title", /No claim quote yet; assumes/);
+    await expect(forwardTime).toHaveText("10 min");
+    await expect(reverseTime).toHaveText("20 min");
+    await forwardTime.hover();
+    await expect(forwardTime).toHaveAttribute("title", "Modeled range: 1 to 24 min. Not a guarantee.");
+    await reverseTime.hover();
+    await expect(reverseTime).toHaveAttribute("title", "Modeled range: 5 to 39 min. Not a guarantee.");
     await expect(page.locator("#swap-providers-intro")).toContainText("Times assume recommended mining rates");
     expect(requests).toHaveLength(3);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await page.locator("#swap-providers-close").click();
     await page.locator("#swap-providers-toggle").click();
-    await expect(forwardTime).toHaveText("1 to 24 min");
+    await expect(forwardTime).toHaveText("10 min");
     expect(requests).toHaveLength(3);
   });
 }
@@ -514,11 +523,13 @@ test("late directory timing cannot overwrite evidence for a different network an
   await page.locator("#swap-settings-close").click();
   await page.locator("#swap-providers-toggle").click();
   const time = page.locator('.swap-provider-group[data-profile="btc-to-ln/v1"] td[data-label="Est. time"]');
-  await expect(time).toHaveText("2 to 47 min");
+  await expect(time).toHaveText("20 min");
+  await expect(time).toHaveAttribute("title", "Modeled range: 2 to 47 min. Not a guarantee.");
   const oldResponse = page.waitForResponse("https://chain.example/signet/api/v1/blocks");
   release!(); await (await oldResponse).finished();
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-  await expect(time).toHaveText("2 to 47 min");
+  await expect(time).toHaveText("20 min");
+  await expect(time).toHaveAttribute("title", "Modeled range: 2 to 47 min. Not a guarantee.");
 });
 
 test("the forward funding view keeps its minute estimate even when Continue skips quote review", async ({ page }) => {
@@ -532,6 +543,19 @@ test("the forward funding view keeps its minute estimate even when Continue skip
   await page.locator("#swap-invoice").fill(testInvoice("tracking-timing", "1000000", now, now + 7200, "tbs"));
   await page.locator("#swap-start").click();
   await expect(page.locator("#swap-funding-uri")).toBeVisible();
-  await expect(page.locator("#swap-tracking-time")).toHaveText("Estimated chain wait: 0 min (no confirmations)");
+  await expect(page.locator("#swap-tracking-time")).toHaveText("Estimated chain wait: 0 min");
+  await expect(page.locator("#swap-tracking-time")).toHaveAttribute("title", /No confirmation wait/);
   await expect(page.locator("#swap-quote-accept")).toHaveCount(0);
+});
+
+test("the final reverse payment screen shows the mean with its modeled range on hover", async ({ page }) => {
+  await liveTiming(page);
+  await page.getByRole("button", { name: "Switch direction" }).click();
+  await page.locator("#swap-receive-amount").fill("50000");
+  await page.locator("#swap-compare").click();
+  await expect(page.locator("#swap-reverse-continue")).toBeEnabled();
+  await page.locator("#swap-receive-address").fill(scriptAddress(`0014${"11".repeat(20)}`, "signet"));
+  await page.locator("#swap-reverse-continue").click();
+  await expect(page.locator("#swap-reverse-time")).toHaveText("Estimated chain wait: 30 min");
+  await expect(page.locator("#swap-reverse-time")).toHaveAttribute("title", "Modeled range: 11 to 54 min. Not a guarantee.");
 });
