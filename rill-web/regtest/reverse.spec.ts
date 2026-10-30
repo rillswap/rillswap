@@ -3,7 +3,7 @@ import { test, expect, type Page } from "@playwright/test";
 import { execFileSync, spawn } from "node:child_process";
 import { mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { assertDisposableStack, composeEnabled } from "./stack";
+import { assertDisposableStack, assertRelayFaultStack, compose, composeEnabled } from "./stack";
 import { stopPaymentProcess } from "./paymentProcess";
 import { openRecoveryKey } from "../tests/fixtures/swapPage";
 
@@ -24,16 +24,27 @@ function inspectBackup(wallet: string, recovery: string): { paymentHash: string;
   return JSON.parse(execFileSync("bun", ["-e", script, wallet, recovery], { cwd: resolve(root, "rill-web"), encoding: "utf8", timeout: 30000 }));
 }
 
-for (const { nodePayment, refusal } of [{ nodePayment: false, refusal: false }, { nodePayment: true, refusal: false }, { nodePayment: false, refusal: true }]) {
-test(`real browser reverse swap (${nodePayment ? "configured node" : "external wallet"}, ${refusal ? "cooperation unavailable" : "cooperative key path"}) pays once and settles`, async ({ page }) => {
+const cases = [{ nodePayment: false, refusal: false, relayLoss: false }, { nodePayment: true, refusal: false, relayLoss: false },
+  { nodePayment: false, refusal: true, relayLoss: false },
+  ...(process.env.RILLSWAP_RUN_RELAY_RESILIENCE === "1" ? [{ nodePayment: true, refusal: false, relayLoss: true }] : [])];
+for (const { nodePayment, refusal, relayLoss } of cases) {
+test(`real browser reverse swap (${nodePayment ? "configured node" : "external wallet"}, ${refusal ? "cooperation unavailable" : relayLoss ? "relay failover during confirmations" : "cooperative key path"}) pays once and settles`, async ({ page }) => {
   test.skip(!enabled && !composeEnabled, "Explicit disposable-regtest opt-in required");
-  assertDisposableStack();
+   assertDisposableStack();
+   if (relayLoss) assertRelayFaultStack();
   expect(project).toMatch(/^rill-reverse-browser-[a-z0-9-]+$/); // refuse the existing/default development project
   expect(process.env.RILL_DEV_WEB_PORT).toMatch(/^[0-9]{4,5}$/);
   expect(process.env.RILL_DEV_WEB_PORT).not.toBe("5273"); mkdirSync(artifacts, { recursive: true });
   let payer: ReturnType<typeof spawn> | undefined;
   try {
    command("miner", "pause");
+   const usedRelays = new Set<string>(), closedRelays = new Set<string>();
+   page.on("websocket", (socket) => {
+     socket.on("framesent", ({ payload }) => {
+       if (typeof payload === "string" && payload.startsWith('["EVENT",')) usedRelays.add(socket.url());
+     });
+     socket.on("close", () => closedRelays.add(socket.url()));
+   });
   const address = command("address", "--wallet", "user");
   let payments = 0, broadcasts = 0;
   const errors: string[] = []; page.on("pageerror", (error) => errors.push(error.message));
@@ -65,6 +76,14 @@ test(`real browser reverse swap (${nodePayment ? "configured node" : "external w
   }
    await expect(page.locator("#swap-reverse-steps h2")).toHaveText("Locking Bitcoin", { timeout: 90000 });
    await expect(page.getByRole("link", { name: "View deposit transaction", exact: true })).toBeVisible({ timeout: 90000 });
+   if (relayLoss) {
+     const primary = `ws://127.0.0.1:${process.env.RILL_DEV_RELAY_PORT}/`;
+     const alternate = `ws://127.0.0.1:${process.env.RILL_DEV_RELAY_ALT_PORT}/`;
+     // Prove these paths carried private session traffic, not just discovery queries.
+     await expect.poll(() => usedRelays.has(primary) && usedRelays.has(alternate)).toBe(true);
+     compose("stop", "relay");
+     await expect.poll(() => closedRelays.has(primary)).toBe(true);
+   }
    // A funded client retains unilateral recovery even if the cooperative peer disappears.
    if (refusal) execFileSync("docker", ["compose", "stop", "maker-ln-to-btc"], { cwd: root, env: process.env, timeout: 30000, stdio: "ignore" });
    command("mine", String(signed.requiredDepth));
@@ -72,7 +91,7 @@ test(`real browser reverse swap (${nodePayment ? "configured node" : "external w
    await expect(page.locator("#swap-status")).toContainText("Claim accepted:", { timeout: 60000 });
    await download(page, '#swap-reverse-backups a', "claim.age");
    const text = await page.locator("#swap-status").textContent(), txid = text!.match(/Claim accepted: ([0-9a-f]{64})/)![1]!;
-   if (refusal) execFileSync("docker", ["compose", "start", "maker-ln-to-btc"], { cwd: root, env: process.env, timeout: 30000, stdio: "ignore" });
+    if (refusal) execFileSync("docker", ["compose", "start", "maker-ln-to-btc"], { cwd: root, env: process.env, timeout: 30000, stdio: "ignore" });
    command("mine", String(signed.settlementDepth));
   await expect.poll(() => JSON.parse(command("lncli", "maker", "lookupinvoice", signed.paymentHash)).state).toBe("SETTLED");
   await expect.poll(() => {
@@ -118,8 +137,9 @@ test(`real browser reverse swap (${nodePayment ? "configured node" : "external w
     // Own the host command group, even if a browser assertion fails after dispatch.
     // Killing it does not establish that LND canceled an already-dispatched payment.
    if (payer) await stopPaymentProcess(payer);
-   if (refusal) execFileSync("docker", ["compose", "start", "maker-ln-to-btc"], { cwd: root, env: process.env, timeout: 30000, stdio: "ignore" });
-   command("miner", "resume");
+    if (refusal) execFileSync("docker", ["compose", "start", "maker-ln-to-btc"], { cwd: root, env: process.env, timeout: 30000, stdio: "ignore" });
+    if (relayLoss) compose("start", "relay");
+    command("miner", "resume");
   }
 });
 }

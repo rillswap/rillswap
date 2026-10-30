@@ -18,12 +18,14 @@ jobs:
         network-fees: ['0', '1']
     env:
       COMPOSE_PROJECT_NAME: rill-reverse-browser-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.network-fees }}
-      COMPOSE_FILE: dev/compose.yaml:dev/compose.ci.yaml
+      COMPOSE_FILE: dev/compose.yaml:dev/compose.ci.yaml:dev/compose.relay-resilience.yaml
       RILLSWAP_RUN_COMPOSE_E2E: '1'
+      RILLSWAP_RUN_RELAY_RESILIENCE: '1'
       RILL_DEV_NETWORK_FEES: ${{ matrix.network-fees }}
       RILL_DEV_WEB_PORT: '15273'
       RILL_DEV_SHOP_PORT: '18090'
       RILL_DEV_RELAY_PORT: '17777'
+      RILL_DEV_RELAY_ALT_PORT: '17778'
       RILL_DEV_CHAIN_PORT: '18091'
       RILL_DEV_BROADCAST_PORT: '18092'
       RILL_DEV_NODE_PORT: '18093'

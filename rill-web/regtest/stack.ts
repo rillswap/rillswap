@@ -18,6 +18,12 @@ export function assertDisposableStack(env: Record<string, string | undefined> = 
   return project;
 }
 
+export function assertRelayFaultStack(env: Record<string, string | undefined> = process.env): void {
+  if (!/^rill-reverse-browser-(relays|ci)-[a-z0-9-]+$/.test(assertDisposableStack(env))) {
+    throw new Error("Relay faults require a dedicated relays or CI project, never an existing UI stack");
+  }
+}
+
 export const webURL = () => `http://127.0.0.1:${process.env.RILL_DEV_WEB_PORT}/swap.html`;
 export const shopURL = () => `http://127.0.0.1:${process.env.RILL_DEV_SHOP_PORT ?? "8090"}`;
 

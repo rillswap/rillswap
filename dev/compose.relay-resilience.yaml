@@ -1,0 +1,53 @@
+# Optional disposable acceptance overlay. Existing stores/configs are never rewritten.
+services:
+  relay-alt:
+    image: scsibug/nostr-rs-relay@sha256:48d54c2d2781577cf3ed2951112f0953dc2c5e7c9d2ea20c64e8c0fa37d16e4d
+    volumes:
+      - ./relay.toml:/usr/src/app/config.toml:ro
+      - relay-alt:/usr/src/app/db
+    ports:
+      - 127.0.0.1:${RILL_DEV_RELAY_ALT_PORT:-17778}:8080
+
+  bootstrap:
+    environment:
+      RILL_DEV_PROVIDER_RELAYS: >-
+        ws://127.0.0.1:${RILL_DEV_RELAY_PORT:-7777}/
+        ws://127.0.0.1:${RILL_DEV_RELAY_ALT_PORT:-17778}/
+    depends_on:
+      relay-alt:
+        condition: service_started
+
+  maker-btc-to-ln:
+    environment:
+      RILL_FORWARD: >-
+        18443=bitcoind:18443 10009=lnd-maker:10009
+        ${RILL_DEV_RELAY_PORT:-7777}=relay:8080
+        ${RILL_DEV_RELAY_ALT_PORT:-17778}=relay-alt:8080
+  maker-ln-to-btc:
+    environment:
+      RILL_FORWARD: >-
+        18443=bitcoind:18443 10009=lnd-maker:10009
+        ${RILL_DEV_RELAY_PORT:-7777}=relay:8080
+        ${RILL_DEV_RELAY_ALT_PORT:-17778}=relay-alt:8080
+  maker-erc20-to-ln:
+    environment:
+      RILL_FORWARD: >-
+        18443=bitcoind:18443 10009=lnd-maker:10009
+        ${RILL_DEV_RELAY_PORT:-7777}=relay:8080
+        ${RILL_DEV_RELAY_ALT_PORT:-17778}=relay-alt:8080
+  maker-ln-to-erc20:
+    environment:
+      RILL_FORWARD: >-
+        18443=bitcoind:18443 10009=lnd-maker:10009
+        ${RILL_DEV_RELAY_PORT:-7777}=relay:8080
+        ${RILL_DEV_RELAY_ALT_PORT:-17778}=relay-alt:8080
+
+  web:
+    environment:
+      VITE_RILLSWAP_RELAY: null
+      VITE_RILLSWAP_RELAYS: >-
+        ws://127.0.0.1:${RILL_DEV_RELAY_PORT:-7777}/
+        ws://127.0.0.1:${RILL_DEV_RELAY_ALT_PORT:-17778}/
+
+volumes:
+  relay-alt:

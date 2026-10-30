@@ -102,6 +102,14 @@ docker compose down --volumes --remove-orphans
 
 Keep the exported project/ports for every command. Use unused ports and a new
 project name for each run. Tests refuse the default project and browser port.
+
+For real relay-failure acceptance, append `dev/compose.relay-resilience.yaml`
+to `COMPOSE_FILE`, set an unused `RILL_DEV_RELAY_ALT_PORT`, and set
+`RILLSWAP_RUN_RELAY_RESILIENCE=1`. The overlay provisions two independent relays
+and matching provider/browser endpoints only for fresh test configurations.
+The Bitcoin browser tests disconnect a relay that actually carried session
+messages while mining is paused, then verify settlement over the remaining
+path. Never run these fault tests against a development project you need to keep.
 CI always saves service status/logs and failure traces/screenshots before
 removing its own containers and volumes. Diagnostics contain disposable dev
 data only, never use this stack with real funds or credentials.

@@ -26,6 +26,15 @@ def test_ci_overlay_only_disables_application_watchers():
     assert "command: [bun, --watch, server.ts]" in COMPOSE
 
 
+def test_relay_resilience_overlay_keeps_the_base_primary_port_default() -> None:
+    overlay = (ROOT / "dev/compose.relay-resilience.yaml").read_text()
+    base = re.findall(r"\$\{RILL_DEV_RELAY_PORT:-(\d+)\}", COMPOSE)
+    assert base
+    assert set(re.findall(r"\$\{RILL_DEV_RELAY_PORT:-(\d+)\}", overlay)) == set(base)
+    assert "RILL_DEV_PROVIDER_RELAYS:" in overlay
+    assert "127.0.0.1:${RILL_DEV_RELAY_ALT_PORT:-17778}:8080" in overlay
+
+
 def test_web_mounts_build_helpers_read_only() -> None:
     assert "../rill-web/scripts:/src/rill-web/scripts:ro" in compose_service("web")
     assert (ROOT / "rill-web/scripts/build-commit.ts").is_file()
