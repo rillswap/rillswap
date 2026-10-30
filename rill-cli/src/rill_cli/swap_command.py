@@ -27,6 +27,7 @@ from rill_cli.age_container import (
 )
 from rill_cli.external_wallet import ExternalWalletPayer, offline_invoice_decoder
 from rill_cli.hold_payment import LndHoldPayer
+from rill_cli.live_relay import LiveRelayConnection
 from rill_cli.live_reverse_swap import ReverseSwapLimits, ReverseSwapOutcome, run_reverse_swap
 from rill_cli.live_swap import SwapError, SwapLimits, SwapOutcome, run_swap
 from rill_cli.publication import publish_new_ciphertext
@@ -127,6 +128,12 @@ def _common_arguments(command: argparse.ArgumentParser, *, lnd_required: bool = 
     command.add_argument("--network", required=True, help="complete trusted network JSON file")
     command.add_argument("--crypto-library", required=True, help="verified native library path")
     command.add_argument("--relay", required=True, help="Nostr relay URL (ws:// or wss://)")
+    command.add_argument(
+        "--fallback-relay",
+        action="append",
+        default=[],
+        help="additional explicitly permitted swap relay (repeatable)",
+    )
     command.add_argument(
         "--relay-proxy",
         help="loopback Tor HTTPTunnelPort URL, required on public networks",
@@ -327,6 +334,8 @@ def run(args: argparse.Namespace, network: NetworkIdentity, identity: str) -> st
     # Refuse an unsafe relay route before the native library, files, or wallet.
     proxy = require_relay_route(network, args.relay_proxy, allow_direct=args.allow_direct_relay)
     RelayConnection(args.relay, proxy=proxy)
+    for fallback in args.fallback_relay:
+        RelayConnection(fallback, proxy=proxy)
     with Context(library_path=args.crypto_library) as crypto:
 
         def write_recovery(document: bytes, previous: bytes | None) -> bytes:
@@ -357,7 +366,12 @@ def run(args: argparse.Namespace, network: NetworkIdentity, identity: str) -> st
         )
 
         async def swap() -> str:
-            async with RelayConnection(args.relay, proxy=proxy) as connection:
+            async with LiveRelayConnection(
+                args.relay,
+                fallbacks=tuple(args.fallback_relay),
+                proxy=proxy,
+                factory=lambda target: RelayConnection(target, proxy=proxy),
+            ) as connection:
                 outcome = await run_swap(
                     connection,
                     identity=args.provider,
@@ -422,7 +436,12 @@ async def _reverse(
         claim_confirmations=args.claim_confirmations,
     )
     proxy = require_relay_route(network, args.relay_proxy, allow_direct=args.allow_direct_relay)
-    async with RelayConnection(args.relay, proxy=proxy) as connection:
+    async with LiveRelayConnection(
+        args.relay,
+        fallbacks=tuple(args.fallback_relay),
+        proxy=proxy,
+        factory=lambda target: RelayConnection(target, proxy=proxy),
+    ) as connection:
         outcome = await run_reverse_swap(
             connection,
             identity=args.provider,

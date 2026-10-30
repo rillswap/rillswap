@@ -208,6 +208,7 @@ upgrade-triggered action or retroactive disclosure assumption.
 | `--claim-confirmations` | Reverse: claim after this many funding confirmations instead of the signed depth (0: from the mempool), with a double-spend warning |
 | `--timeout` | Per-answer timeout, default 60 seconds |
 | `--settle-timeout` | Settlement lifetime, default 3,600 seconds |
+| `--fallback-relay` | Additional explicitly permitted live-swap relay; repeatable, at most eight total |
 
 On public networks, discovery and swaps need either
 `--relay-proxy http://127.0.0.1:9080` (a local Tor `HTTPTunnelPort`) or
@@ -217,6 +218,14 @@ and authenticates; onion relays need `--relay-proxy`. There is no direct
 fallback. Regtest allows direct connections. `providers list` accepts repeated
 `--relay` arguments and skips onion relays quietly when there is no proxy;
 compare independent relays, since a relay can withhold announcements.
+
+Live swap commands reconnect and restore their original mailbox subscription
+after a disconnect, including while blocks confirm. With `--fallback-relay`,
+up to two paths are kept live. Reconnection preserves the session, signed
+messages, payment lifetime and claim deadlines; it never restarts a payment
+or signing attempt. A long confirmation wait may need an explicitly larger
+`--settle-timeout`, not a renewed timeout after each reconnect. Library callers
+can supply `LiveRelayConnection`; caller-owned single sockets remain supported.
 
 Each listed announcement shows the provider's funding confirmations under
 `extensions["rillswap/funding-confirmations"]`; without that key the depth is

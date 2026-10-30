@@ -50,10 +50,10 @@ if TYPE_CHECKING:
 
     from rill_core.wire.messages import InvoiceBinding
     from rill_crypto import Context
-    from rill_provider.relay_client import RelayConnection
 
     from rill_cli.conversion_journal import ConversionJournal, ConversionReservation, _LiveRight
     from rill_cli.hold_payment import HoldStatus
+    from rill_cli.live_relay import RelayTransport
     from rill_cli.wallet_rpc import ConfirmedOutput, HistoricalWalletOutput
 
 
@@ -419,7 +419,7 @@ class _Invocation:
 async def run_reserved_conversion(  # noqa: PLR0913 - one explicit original execution boundary
     journal: ConversionJournal,
     reservation: ConversionReservation,
-    connection: RelayConnection,
+    connection: RelayTransport,
     *,
     config: ReverseExecutionConfig,
     limits: ReverseSwapLimits,

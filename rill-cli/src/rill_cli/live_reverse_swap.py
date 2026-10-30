@@ -105,9 +105,9 @@ if TYPE_CHECKING:
         InvoiceBinding,
     )
     from rill_crypto import Context
-    from rill_provider.relay_client import RelayConnection
 
     from rill_cli.hold_payment import HoldStatus
+    from rill_cli.live_relay import RelayTransport
     from rill_cli.wallet_rpc import ConfirmedOutput
 
 PROFILE: Literal["ln-to-btc/v1"] = "ln-to-btc/v1"
@@ -1032,7 +1032,8 @@ async def _cooperative_claim(  # noqa: PLR0911, PLR0912, PLR0913, PLR0915 - keep
             check_window()
             async with asyncio.timeout(max(0, deadline - time.monotonic())):
                 on_disclosure()  # Sending may disclose the preimage even when the reply is lost.
-                await session.send(proposal, session.provider_key or "")
+                with session.guard_publication(check_window):
+                    await session.send(proposal, session.provider_key or "")
                 check_window()
                 report("cooperative claim proposed; waiting for the provider's signature")
                 reply = await session.receive(
@@ -1228,7 +1229,7 @@ async def _await_claim_settlement(  # noqa: PLR0913 - original operation and exa
 
 
 async def run_reverse_swap(  # noqa: PLR0912, PLR0913, PLR0915 - one ordered swap story
-    connection: RelayConnection,
+    connection: RelayTransport,
     *,
     identity: str,
     network: NetworkIdentity,

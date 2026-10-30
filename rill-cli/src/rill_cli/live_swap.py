@@ -22,7 +22,7 @@ import json
 import math
 import secrets
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
@@ -103,7 +103,7 @@ from rill_provider.provider_identity import (
 from rill_cli.wallet_rpc import CooperativeClaimEvidence
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Callable, Iterator
 
     from rill_core.settlement.taproot import TaprootKeyOperations
     from rill_core.settlement.unilateral import CooperativeClaimPlan, ValidatedCooperativeClaim
@@ -111,8 +111,8 @@ if TYPE_CHECKING:
     from rill_core.wire.types import NetworkIdentity
     from rill_crypto import Context
     from rill_provider.core_tx_bytes import NextBlockFee
-    from rill_provider.relay_client import RelayConnection
 
+    from rill_cli.live_relay import RelayTransport
     from rill_cli.wallet_rpc import WalletFunding
 
 PROFILE: Literal["btc-to-ln/v1"] = "btc-to-ln/v1"
@@ -344,7 +344,7 @@ def _transport_work(advertisement: dict[str, Any]) -> int:
 
 
 async def discover(  # noqa: PLR0913 - explicit trust inputs
-    connection: RelayConnection,
+    connection: RelayTransport,
     *,
     identity: str,
     network: NetworkIdentity,
@@ -396,7 +396,7 @@ class _Session:
 
     def __init__(
         self,
-        connection: RelayConnection,
+        connection: RelayTransport,
         crypto: Context,
         network: NetworkIdentity,
         *,
@@ -425,6 +425,7 @@ class _Session:
         self._provider_pending_bytes = 0
         self._settlement_active = False
         self._cooperative_attempt_started = False
+        self._publication_guard: Callable[[], None] | None = None
 
     @asynccontextmanager
     async def settlement_stream(self) -> AsyncIterator[None]:
@@ -477,7 +478,17 @@ class _Session:
         )
         return unsigned.model_copy(update={"signature": bytes(signature).hex()})
 
+    @contextmanager
+    def guard_publication(self, guard: Callable[[], None]) -> Iterator[None]:
+        """Fence actual writes, including any transport-owned reconnect waits."""
+        previous, self._publication_guard = self._publication_guard, guard
+        try:
+            yield
+        finally:
+            self._publication_guard = previous
+
     async def send(self, envelope: Envelope, recipient: str) -> None:
+        before_publish = self._publication_guard
         event = _wrap_envelope(
             canonicalize(envelope.model_dump(mode="json")),
             sender_session_secret=self.secret,
@@ -486,7 +497,15 @@ class _Session:
             work_bits=self.work_bits,
         )
         for _ in range(3):
-            if await self.connection.publish(event):
+            if before_publish is not None:
+                before_publish()
+            guarded = getattr(self.connection, "publish_guarded", None)
+            accepted = (
+                await guarded(event, before_publish)
+                if guarded is not None and before_publish is not None
+                else await self.connection.publish(event)
+            )
+            if accepted:
                 return
         raise SwapError(f"relay did not accept {envelope.message_type}")
 
@@ -1526,7 +1545,7 @@ async def _drain_cooperative_workers(owner: _CooperativeClaimAttempt) -> None:
 
 
 async def run_swap(  # noqa: PLR0913, PLR0915 - one ordered swap story
-    connection: RelayConnection,
+    connection: RelayTransport,
     *,
     identity: str,
     network: NetworkIdentity,
