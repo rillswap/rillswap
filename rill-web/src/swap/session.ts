@@ -110,14 +110,24 @@ export function unwrapGiftWrap(
 
 /** The relay surface a session needs; see relay.ts for the WebSocket one. */
 export interface RelayLink {
-  publish(event: NostrEvent): Promise<boolean>;
+  readonly failureReason?: string | undefined;
+  /** True only when publish runs beforePublish itself, immediately before each socket write. */
+  readonly guardedPublication?: boolean;
+  publish(event: NostrEvent, options?: PublicationOptions): Promise<boolean>;
   subscribe(filter: Record<string, unknown>): Promise<void>;
   /** The next raw event JSON for our subscription, or null at the deadline. */
-  next(deadline: number): Promise<string | null>;
+  next(deadline: number, signal?: AbortSignal): Promise<string | null>;
+}
+
+/** Checked at the actual socket write, including after reconnecting. */
+export interface PublicationOptions {
+  readonly beforePublish?: () => void;
+  readonly signal?: AbortSignal;
+  readonly timeoutMs?: number;
 }
 
 export class SwapError extends Error {
-  constructor(message: string) {
+  constructor(message: string, readonly transportReason?: string) {
     super(message);
     this.name = "SwapError";
   }
@@ -182,8 +192,12 @@ export class Session {
   /** RS-006 transport work declared at initiation, mined into every send. */
   workBits = 0;
   private sequence = 0;
-  private readonly seen = new Set<string>();
   private readonly inbox: Envelope[] = [];
+  private readonly bySequence = new Map<number, { id: string; digest: string }>();
+  private readonly byId = new Map<string, string>();
+  private readonly future = new Map<number, Envelope>();
+  private providerNext = 0;
+  private inboxBytes = 0;
 
   constructor(
     readonly relay: RelayLink,
@@ -222,13 +236,14 @@ export class Session {
     return { ...unsigned, signature: bytesToHex(schnorr.sign(digest, this.secret, randomBytes(32))) };
   }
 
-  async send(envelope: Envelope, recipient: string, beforePublish?: () => void): Promise<void> {
+  async send(envelope: Envelope, recipient: string, beforePublish?: () => void, options: PublicationOptions = {}): Promise<void> {
     const event = await wrapWithTransportWork(new TextDecoder().decode(jcs(envelope)), this.secret, recipient, this.workBits);
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      beforePublish?.();
-      if (await this.relay.publish(event)) return;
+      options.signal?.throwIfAborted();
+      if (!this.relay.guardedPublication) beforePublish?.();
+      if (await this.relay.publish(event, { ...options, ...(beforePublish ? { beforePublish } : {}) })) return;
     }
-    throw new SwapError(`relay did not accept ${envelope.message_type}`);
+    throw new SwapError(`relay did not accept ${envelope.message_type}`, this.relay.failureReason);
   }
 
   async listen(): Promise<void> {
@@ -239,27 +254,53 @@ export class Session {
   /** Admit one raw event as an authenticated envelope for this session, or null. */
   admit(raw: string): Envelope | null {
     const envelope = authenticateSessionEvent(raw, this.secret, this.network, this.profile, this.sessionId, this.providerKey);
-    if (envelope === null || this.seen.has(envelope.message_id)) return null;
-    this.seen.add(envelope.message_id);
+    if (envelope === null) return null;
+    const digest = bytesToHex(unsignedEnvelopeHash(envelope as unknown as Record<string, unknown>));
+    const knownId = this.byId.get(envelope.message_id), knownSequence = this.bySequence.get(envelope.sequence);
+    if ((knownId !== undefined && knownId !== digest) || (knownSequence !== undefined &&
+      (knownSequence.id !== envelope.message_id || knownSequence.digest !== digest))) throw new SwapError("conflicting provider sequence or message ID");
+    if (knownId !== undefined) return null;
+    if (envelope.sequence < this.providerNext || envelope.sequence > this.providerNext + 16 || this.byId.size >= 4096)
+      throw new SwapError("provider sequence outside the bounded live window");
+    this.byId.set(envelope.message_id, digest);
+    this.bySequence.set(envelope.sequence, { id: envelope.message_id, digest });
+    if (envelope.sequence !== this.providerNext) { this.future.set(envelope.sequence, envelope); return null; }
+    this.providerNext++;
+    for (;;) {
+      const ready = this.future.get(this.providerNext); if (!ready) break;
+      this.future.delete(this.providerNext++); this.buffer(ready);
+    }
     return envelope;
   }
 
-  async receive(wanted: (envelope: Envelope) => boolean, timeoutMs = this.timeoutMs): Promise<Envelope> {
-    const index = this.inbox.findIndex(wanted);
-    if (index >= 0) return this.inbox.splice(index, 1)[0]!;
+  private buffer(envelope: Envelope): void {
+    const size = jcs(envelope).length;
+    if (this.inbox.length >= 64 || this.inboxBytes + size > 256 * 1024) throw new SwapError("provider live inbox exhausted");
+    this.inbox.push(envelope); this.inbox.sort((a, b) => a.sequence - b.sequence); this.inboxBytes += size;
+  }
+
+  private take(index: number): Envelope {
+    const envelope = this.inbox.splice(index, 1)[0]!; this.inboxBytes -= jcs(envelope).length; return envelope;
+  }
+
+  async receive(wanted: (envelope: Envelope) => boolean, timeoutMs = this.timeoutMs, signal?: AbortSignal): Promise<Envelope> {
+    signal?.throwIfAborted();
     const deadline = this.clock() + timeoutMs;
     for (;;) {
-      const raw = await this.relay.next(deadline);
+      signal?.throwIfAborted();
+      const index = this.inbox.findIndex(wanted);
+      if (index >= 0) return this.take(index);
+      const raw = await this.relay.next(deadline, signal);
       if (raw === null) throw new SwapError("timed out waiting for the provider");
       const admitted = this.admit(raw);
       if (admitted === null) continue;
       if (wanted(admitted)) return admitted;
-      this.inbox.push(admitted);
+      this.buffer(admitted);
     }
   }
 
-  async replyTo(request: Envelope, expected: string, timeoutMs = this.timeoutMs): Promise<Envelope> {
-    const answer = await this.receive((item) => item.in_reply_to === request.message_id, timeoutMs);
+  async replyTo(request: Envelope, expected: string, timeoutMs = this.timeoutMs, signal?: AbortSignal): Promise<Envelope> {
+    const answer = await this.receive((item) => item.in_reply_to === request.message_id, timeoutMs, signal);
     if (answer.message_type === "error") {
       throw new SwapError(`provider refused ${request.message_type}: ${String(answer.payload.code)}`);
     }

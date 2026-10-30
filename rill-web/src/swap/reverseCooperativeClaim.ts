@@ -8,6 +8,7 @@ import type { Musig, MusigAttempt } from "./musig";
 import type { Session } from "./session";
 import { reconstructTaprootContract } from "./taproot";
 import { parseTransaction } from "./transaction";
+import { requestReply } from "./requestReply";
 import { COOPERATIVE_CLAIM_FEATURE, EPOCH_SESSION_FEATURE, type HandshakeInit, type HandshakeAccept, type LnToBtcTerms } from "./wire";
 import type { RecoveryFundingBinding } from "../recoveryInspection";
 
@@ -68,6 +69,7 @@ export async function reverseCooperativeClaim(options: ReverseCooperationOptions
   let musig: Musig | undefined, attempt: MusigAttempt | undefined, finished = false;
   // Only these fixed strings reach the log: never ids, nonces, signatures or the preimage.
   let step = "before the proposal";
+  let reportedRetry = false;
   const report = (line: string): void => { try { options.report?.(`cooperation: ${line}`); } catch { /* Reporting never changes the claim. */ } };
   const fallback = "; claiming with the signed script-path transaction";
   try {
@@ -104,9 +106,11 @@ export async function reverseCooperativeClaim(options: ReverseCooperationOptions
       step = "recording the disclosure";
       if (options.beforeDisclosure) { await bounded(options.beforeDisclosure); live(); }
       step = "sending the proposal";
-      await bounded(() => session.send(proposal, session.providerKey!, () => { live(); options.onDisclosure?.(); })); live();
-      step = "waiting for the provider's signature";
-      const reply = await bounded(() => session.replyTo(proposal, "action_result", remaining())); live();
+      const reply = await bounded(() => requestReply(session, proposal, "action_result", {
+        remaining, beforePublish: () => { live(); options.onDisclosure?.(); },
+        onAccepted: () => { step = "waiting for the provider's signature"; },
+        onRetry: (reason) => { if (!reportedRetry) { reportedRetry = true; report(`relay ${reason}; retrying the same proposal`); } },
+      })); live();
       step = "checking the provider's reply";
       require(reply.sender_session_key === session.providerKey && reply.session_id === session.sessionId && reply.profile_id === session.profile &&
         canonicalize(reply.network_identity) === canonicalize(session.network) && reply.contract_hash === hash && reply.message_type === "action_result" &&

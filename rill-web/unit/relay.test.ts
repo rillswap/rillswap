@@ -51,6 +51,12 @@ test("relay URLs must be wss unless loopback or a v3 onion", () => {
 });
 
 describe("relay connection", () => {
+  test("a socket already closing cannot mark a proposal as disclosed", async () => {
+    const { relay, socket } = await connect(); let disclosures = 0;
+    Object.assign(socket, { readyState: 2 });
+    expect(await relay.publish({ id: "private" } as NostrEvent, { beforePublish: () => { disclosures++; } })).toBe(false);
+    expect(disclosures).toBe(0); expect(socket.sent).toEqual([]); relay.close();
+  });
   test("canceling opening or connected relays closes their sockets", async () => {
     const cancellation = new AbortController();
     const socket = new FakeSocket();

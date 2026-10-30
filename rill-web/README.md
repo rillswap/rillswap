@@ -143,6 +143,15 @@ point Settings at their own mempool or Esplora instance (transaction links
 use the same instance). Plain `http:` is admitted only for the loopback
 endpoints configured at build time. Custom endpoints must allow CORS.
 
+Live swaps retain their session across relay disconnects and restore the
+original mailbox history filter, even after long confirmation waits. Up to
+two permitted relay paths may be active. Alternatives must be in the user's
+selected relay set and the provider's signed endpoints; merely caching an
+announcement does not make a relay a provider endpoint. Extra paths expose
+messaging metadata to those relays. Recovery archive queries remain separate
+and read-only. Cooperative request retries reuse the original signed message
+and nonce within the original single 30-second window, never a new attempt.
+
 New stablecoin swaps require independently configured asset pins. Each entry
 includes the chain, HTLC and token addresses, decimals, block interval and
 deployment namespace from RS-010. Provider symbols never select a token.

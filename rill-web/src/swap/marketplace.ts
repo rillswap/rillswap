@@ -5,7 +5,8 @@ import { ANNOUNCEMENT_KIND, MAX_DISCOVERY_EVENTS } from "./discovery";
 import { MAX_RELAYS } from "./config";
 import { isOnionRelay } from "./publicRelays";
 import { RelayConnection, type RelayQueryResult } from "./relay";
-import { SwapError } from "./session";
+import type { LiveRelayLink } from "./liveRelayLink";
+import { SwapError, type RelayLink } from "./session";
 import { ProtocolError, same } from "./wire";
 import { type PreparedReverseQuote, prepareReverseQuote, type ReverseSwapRequest } from "./reverseSwap";
 import { prepareSwap, type PreparedSwap, type SwapRequest } from "./swap";
@@ -22,6 +23,8 @@ export interface LocatedProvider {
   readonly announcement: AnnouncementCandidate;
   readonly rawAnnouncement: string;
   readonly relayUrls: readonly string[];
+  /** User-selected discovery routes, distinct from where this revision happened to be cached. */
+  readonly permittedRelayUrls?: readonly string[];
 }
 
 export interface RelayObservation {
@@ -111,6 +114,7 @@ export function scanAnnouncements(
       .filter(({ announcement }) => !equivocating.has(announcement.identityXOnlyKey))
       .map(({ announcement, rawAnnouncement, relays }) => ({
         announcement, rawAnnouncement, relayUrls: Object.freeze([...relays]),
+        permittedRelayUrls: Object.freeze([...new Set(observations.map(({ url }) => url))]),
       })),
     warnings,
   };
@@ -325,9 +329,16 @@ function failureReason(error: unknown): string {
   return error instanceof SwapError || error instanceof ProtocolError ? error.message : "no usable reply";
 }
 
+function canonicalRelayUrl(text: string): string | null {
+  try {
+    const url = new URL(text);
+    return url.protocol === "ws:" || url.protocol === "wss:" ? url.href : null;
+  } catch { return null; }
+}
+
 async function fanOutQuotes<P extends { dispose(): void }>(
   providers: readonly LocatedProvider[],
-  prepare: (relay: RelayConnection, provider: LocatedProvider) => Promise<P>,
+  prepare: (relay: RelayLink & Pick<RelayConnection, "query">, provider: LocatedProvider) => Promise<P>,
   signal?: AbortSignal,
 ): Promise<QuoteFanOut<P>> {
   const completed = new Set<LocatedQuote<P>>();
@@ -340,16 +351,27 @@ async function fanOutQuotes<P extends { dispose(): void }>(
     for (const url of provider.relayUrls) {
       if (signal?.aborted) return null;
       let relay: RelayConnection | undefined;
+      let live: LiveRelayLink | undefined;
+      const abort = (): void => live?.close();
       try {
         relay = await RelayConnection.open(url, 10_000, undefined, signal);
         signal?.throwIfAborted();
-        const prepared = await prepare(relay, provider);
-        const connection = relay;
+        // Observing a cached advertisement does not prove that its relay is a provider endpoint.
+        // Only already user-selected and provider-signed alternatives are eligible for failover.
+        const endpoints = new Set((provider.announcement.advertisedEndpoints ?? []).map(canonicalRelayUrl).filter((endpoint) => endpoint !== null));
+        const alternatives = (provider.permittedRelayUrls ?? provider.relayUrls).filter((candidate) => {
+          const url = canonicalRelayUrl(candidate); return url !== null && endpoints.has(url);
+        });
+        live = relay.resilient?.(url, alternatives);
+        signal?.addEventListener("abort", abort, { once: true });
+        const prepared = await prepare(live ?? relay, provider);
+        const connection = live ?? relay;
         const quote = { prepared, relayUrl: url, dispose: () => { prepared.dispose(); connection.close(); } };
         if (signal?.aborted) { quote.dispose(); return null; }
         completed.add(quote);
         return quote;
-      } catch (error) { relay?.close(); reason = failureReason(error); }
+      } catch (error) { if (live) live.close(); else relay?.close(); reason = failureReason(error); }
+      finally { signal?.removeEventListener("abort", abort); }
     }
     reasons.push(`${shortIdentity(provider)}: ${reason}`);
     return null;
