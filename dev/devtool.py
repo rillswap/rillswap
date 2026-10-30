@@ -56,6 +56,9 @@ CHANNEL_SAT = 5_000_000
 LND_FUND_BTC = 10
 CORE_FUND_BTC = 10
 MATURE_HEIGHT = 150
+# LND (bitcoind backend) reports synced_to_chain only within two hours of the
+# tip's timestamp; refresh well inside that so a persisted chain can resync.
+STALE_TIP_SECONDS = 3600
 MONEROD_URL = "http://monerod:18081"
 MONERO_WALLETS = ("merchant", "buyer")
 MONERO_WALLET_DIRS = Path(os.environ.get("RILL_DEV_MONERO_WALLETS", "/monero-wallets"))
@@ -319,7 +322,22 @@ def ensure_wallet(name: str) -> None:
         core("createwallet", name)
 
 
+def refresh_stale_tip() -> None:
+    """Mine once if the chain tip is too old for LND to call itself synced.
+
+    LND (bitcoind backend) only reports ``synced_to_chain`` when the best
+    block is recent. A persisted regtest chain resumes with a stale tip, so
+    without this LND would never report synced and the sync wait would hang.
+    No-op on a freshly mined tip, so the normal bootstrap adds no extra block.
+    """
+    if time.time() - int(Core()("getblockchaininfo")["time"]) > STALE_TIP_SECONDS:
+        log("refreshing a stale chain tip so LND can report synced")
+        mine(1)
+
+
 def wait_lnd_synced(nodes: list[Lnd]) -> None:
+    refresh_stale_tip()
+
     def synced() -> bool:
         height = Core()("getblockcount")
         return all(
