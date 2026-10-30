@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 from typing import TYPE_CHECKING, Any, Protocol, Self
 
+from rill_provider.diagnostics import diagnostic
 from rill_provider.relay_client import RelayConnection, RelayError
 
 if TYPE_CHECKING:
@@ -59,6 +61,20 @@ class LiveRelayConnection:
         self._fault: RelayError | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._seed: RelayConnection | None = None
+        self._availability: dict[str, bool] = {}
+
+    def _status(self, url: str, *, available: bool) -> None:
+        if self._availability.get(url) == available:
+            return
+        self._availability[url] = available
+        diagnostic(
+            logging.getLogger(__name__),
+            "relay.connected" if available else "relay.unavailable",
+            "Swap relay connected" if available else "Swap relay unavailable; reconnecting",
+            level=logging.INFO if available else logging.WARNING,
+            relay=url,
+            retry_seconds=None if available else int(self._retry_seconds),
+        )
 
     async def __aenter__(self) -> Self:
         for url in self.urls:
@@ -66,6 +82,7 @@ class LiveRelayConnection:
             try:
                 await connection.__aenter__()
             except RelayError:
+                self._status(url, available=False)
                 continue
             self._seed = connection
             self._tasks.append(asyncio.create_task(self._maintain((url, connection))))
@@ -122,6 +139,7 @@ class LiveRelayConnection:
                 self._opening.discard(url)
                 self._changed.set()
                 delay = self._retry_seconds
+                self._status(url, available=True)
                 async for event in connection.events():
                     try:
                         self._queue.put_nowait(event)
@@ -138,6 +156,7 @@ class LiveRelayConnection:
                 await connection.__aexit__(None, None, None)
                 self._changed.set()
             if not self._stopped:
+                self._status(url, available=False)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30.0)
 

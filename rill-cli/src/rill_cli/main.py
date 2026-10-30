@@ -84,6 +84,13 @@ def _parser() -> argparse.ArgumentParser:  # noqa: PLR0915 - one flat command ta
     parser = argparse.ArgumentParser(
         prog="rill", description="Pre-release RillSwap client and recovery tools"
     )
+    parser.add_argument(
+        "--log-format",
+        choices=("text", "json"),
+        default="text",
+        help="stderr diagnostics (stdout results are unchanged)",
+    )
+    parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING"), default="INFO")
     recover = parser.add_subparsers(dest="category", required=True)
     swap_command.add_parser(recover)
     provider_directory.add_parser(recover)
@@ -652,8 +659,7 @@ def _watch_claim(  # noqa: PLR0913 - explicit wiring of the collaborators
     unavailable_reported = False
 
     def report(line: str) -> None:
-        sys.stderr.write(line + "\n")
-        sys.stderr.flush()
+        swap_command._report(line)  # noqa: SLF001 - shared command progress renderer
 
     # The live swap may already have broadcast the claim it prepared (and then
     # given up waiting): watch that one too, observation only.
@@ -808,6 +814,7 @@ def _watch_refund(  # noqa: PLR0913 - explicit wiring of the collaborators
         escalate_blocks=args.escalate_blocks,
         chain=chain,
         invoice_state=invoice_state,
+        report=swap_command._report,  # noqa: SLF001 - shared command progress renderer
         sign=sign,
         submit=submit,
         confirmations=confirmations,
@@ -871,6 +878,9 @@ def _providers(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911 - distinct failure exit codes
     """Run explicit recovery commands only; sanitize errors and private input."""
     args = _parser().parse_args(argv)
+    from rill_provider.diagnostics import configure_logging  # noqa: PLC0415 - stderr only
+
+    configure_logging(args.log_level, log_format=args.log_format)
     if args.category == "swap":
         return _swap(args)
     if args.category == "providers":

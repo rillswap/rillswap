@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -178,6 +179,7 @@ class RefundWatcher:
         verifier: SchnorrVerifier,
         poll_seconds: float = 30.0,
         sleep: Callable[[float], None] = time.sleep,
+        report: Callable[[str], None] = LOG.info,
     ) -> None:
         """Take the recorded history and the explicit collaborators."""
         if initial_fee_sat < 0 or max_fee_sat < initial_fee_sat or escalate_blocks < 1:
@@ -191,6 +193,15 @@ class RefundWatcher:
         self._sign, self._submit, self._confirmations = sign, submit, confirmations
         self._authorization, self._verifier = authorization, verifier
         self._poll, self._sleep = poll_seconds, sleep
+        self._report = report
+        self._last_progress: str | None = None
+
+    def _progress(self, line: str) -> None:
+        if line == self._last_progress:
+            return
+        self._last_progress = line
+        with suppress(Exception):  # progress cannot change signing or submission
+            self._report(line)
 
     def run(self, *, max_polls: int | None = None) -> dict[str, Any] | None:
         """Poll until an outcome; ``None`` only when ``max_polls`` ran out."""
@@ -203,12 +214,12 @@ class RefundWatcher:
             self._sleep(self._poll)
         return None
 
-    def step(self) -> dict[str, Any] | None:  # noqa: PLR0911 - one closed rule per branch
+    def step(self) -> dict[str, Any] | None:  # noqa: PLR0911, PLR0912 - one rule per branch
         """One poll: refuse, finish, wait, rebroadcast, or record and send a bump."""
         if self._invoice_state is not None:
             invoice = self._invoice_state()
             if invoice is None:
-                LOG.info("invoice state unavailable; not refunding without it")
+                self._progress("invoice state unavailable; not refunding without it")
                 return None
             if invoice == "SETTLED":
                 return self._outcome("invoice_settled", refund="refused: the provider paid")
@@ -221,8 +232,15 @@ class RefundWatcher:
                     return self._outcome(
                         "refund_confirmed", refund_txid=attempt.txid, confirmations=depth
                     )
-            return None if view is None else self._outcome("outpoint_spent_elsewhere")
+            if view is None:
+                self._progress("chain data unavailable; keeping the recorded refund attempts")
+                return None
+            return self._outcome("outpoint_spent_elsewhere")
         if view.tip_height <= self._lock_height:
+            self._progress(
+                f"waiting for refund maturity: block {view.tip_height}, "
+                f"first eligible block {self._lock_height + 1}"
+            )
             return None
         latest = self.attempts[-1] if self.attempts else None
         initial, maximum, blocks = self._fees
@@ -244,8 +262,11 @@ class RefundWatcher:
         attempt = RefundAttempt(len(self.attempts), txid, raw, fee, vsize, view.tip_height)
         self._record(attempt)  # durable before the send
         self.attempts.append(attempt)
+        self._progress(f"refund attempt {attempt.attempt} recorded: txid {txid}, fee {fee} sat")
         if not self._submit(raw, txid):
-            LOG.info("refund attempt %d not accepted yet; recorded", attempt.attempt)
+            self._progress(f"refund attempt {attempt.attempt} not accepted yet; recorded")
+        else:
+            self._progress(f"refund submitted: {txid}; waiting for chain confirmation")
         return None
 
     def _record(self, attempt: RefundAttempt) -> None:
@@ -269,6 +290,7 @@ class RefundWatcher:
         )
 
     def _outcome(self, outcome: Outcome, **extra: Any) -> dict[str, Any]:  # noqa: ANN401
+        self._progress(f"refund watch outcome: {outcome}")
         return {
             "kind": "btc-to-ln-refund-watch/v1",
             "outcome": outcome,

@@ -88,6 +88,21 @@ Use `rill <command> --help` for exact arguments, for example
 
 ## Swapping
 
+### Progress and diagnostics
+
+Progress goes to stderr with UTC timestamps and event/context fields. Use
+`rill --log-format json swap ...` for newline-delimited diagnostic records,
+or `rill --log-level DEBUG recover ...` for more detail. Logging options precede
+the command category. stdout results, JSON responses and exit codes are unchanged.
+External-wallet invoices and QR codes remain deliberate payment UI on stderr,
+not diagnostic records (that display is not JSON).
+
+Local diagnostics include payment/invoice hashes, amounts, fees and decoded
+memos when available. They are financially sensitive. Do not upload raw terminal
+output: it can also contain an invoice or the existing successful-swap preimage.
+Refund watching reports changed waits, maturity, recorded attempts and outcomes;
+an unavailable backend or unknown submission is never permission to pay again.
+
 ### Bitcoin to Lightning
 
 `rill swap btc-to-ln` pays `--invoice` from your Core `--wallet`:

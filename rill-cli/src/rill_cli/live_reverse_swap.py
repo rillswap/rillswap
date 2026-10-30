@@ -24,11 +24,13 @@ import asyncio
 import contextvars
 import hashlib
 import inspect
+import logging
 import math
 import re
 import secrets
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, TypeVar, cast
 
@@ -74,7 +76,9 @@ from rill_core.wire.reverse_quotes import (
 from rill_core.wire.settlement_messages import FundingBindingPayload, parse_observation
 from rill_core.wire.types import NetworkIdentity
 from rill_provider.core_tx_bytes import NextBlockFee
+from rill_provider.diagnostics import diagnostic, diagnostic_context
 from rill_provider.lnd_payment_observation import LndObservationError
+from rill_provider.settlement_diagnostics import terms_facts
 
 from rill_cli.claim_watcher import ClaimAttempt, ClaimWatcher
 from rill_cli.external_wallet import DO_NOT_PAY_AGAIN
@@ -1357,6 +1361,22 @@ async def run_reverse_swap(  # noqa: PLR0912, PLR0913, PLR0915 - one ordered swa
             if warning is not None:
                 report(warning)  # before paying, so the user can still stop
             economics = terms.economics
+            source_report = report
+            diagnostic_fields: dict[str, object] = {"session_id": session.session_id}
+            with suppress(Exception):  # optional metadata has no financial authority
+                diagnostic_fields.update(terms_facts(terms))
+
+            def contextual_report(line: str) -> None:
+                with diagnostic_context(**diagnostic_fields):
+                    source_report(line)
+
+            report = contextual_report
+            diagnostic(
+                logging.getLogger(__name__),
+                "terms.verified",
+                "Verified signed swap terms",
+                details=diagnostic_fields,
+            )
             contract = offer.terms.contract_hash
             min_incoming = int(terms.timing_policy.model_dump()["min_incoming_htlc_expiry_height"])
             report(

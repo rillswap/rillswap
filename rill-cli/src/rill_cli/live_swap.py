@@ -19,10 +19,11 @@ import asyncio
 import contextvars
 import hashlib
 import json
+import logging
 import math
 import secrets
 import time
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
@@ -94,11 +95,13 @@ from rill_provider import _transport_pow as transport_pow
 from rill_provider._nip59_receive import _decode_gift_wrap_candidate
 from rill_provider._nip59_send import _wrap_envelope
 from rill_provider.core_tx_bytes import CooperativeClaimOutpoint, CooperativeFeePolicy
+from rill_provider.diagnostics import diagnostic, diagnostic_context
 from rill_provider.provider_identity import (
     ADVERTISEMENT_TAG,
     ANNOUNCEMENT_KIND,
     FUNDING_CONFIRMATIONS_EXTENSION,
 )
+from rill_provider.settlement_diagnostics import terms_facts
 
 from rill_cli.wallet_rpc import CooperativeClaimEvidence
 
@@ -1573,6 +1576,20 @@ async def run_swap(  # noqa: PLR0913, PLR0915 - one ordered swap story
     )
     session = _Session(connection, crypto, network, timeout=timeout)
     init, accept, accept_signature, transcript = await _handshake(session, advertisement, identity)
+    source_report = report
+    diagnostic_fields: dict[str, object] = {
+        "session_id": session.session_id,
+        "profile": "btc-to-ln/v1",
+        "network": network.name,
+        "payment_hash": binding_invoice.payment_hash,
+        "amount_msat": binding_invoice.amount_msat,
+    }
+
+    def contextual_report(line: str) -> None:
+        with diagnostic_context(**diagnostic_fields):
+            source_report(line)
+
+    report = contextual_report
     report(f"session {session.session_id[:16]} confirmed")
     provider_key = session.provider_key or ""
 
@@ -1620,6 +1637,14 @@ async def run_swap(  # noqa: PLR0913, PLR0915 - one ordered swap story
     )
     require_announced_depth(terms.funding_confirmations, advertisement)
     economics = terms.economics
+    with suppress(Exception):  # optional metadata has no financial authority
+        diagnostic_fields.update(terms_facts(terms))
+    diagnostic(
+        logging.getLogger(__name__),
+        "terms.verified",
+        "Verified signed swap terms",
+        details=diagnostic_fields,
+    )
     report(
         f"terms: fund {economics.contract_amount_sat} sat, refund after block "
         f"{terms.refund_lock_height}"

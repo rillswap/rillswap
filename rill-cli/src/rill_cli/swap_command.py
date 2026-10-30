@@ -17,6 +17,7 @@ from rill_core.recovery import (
 from rill_core.wire.canonical import parse_json_strict
 from rill_crypto import Context
 from rill_provider.core_tx_bytes import MAX_FEE_ESTIMATE_CEILING_SAT_VB
+from rill_provider.diagnostics import write_progress
 from rill_provider.lnd_invoice_decode import LndInvoiceDecoder
 from rill_provider.relay_client import RelayConnection, require_relay_route
 
@@ -165,6 +166,11 @@ def _common_arguments(command: argparse.ArgumentParser, *, lnd_required: bool = 
 
 
 def _report(line: str) -> None:
+    write_progress(line)
+
+
+def _payment_prompt(line: str) -> None:
+    """Intentional invoice/QR display, never part of the diagnostic stream."""
     sys.stderr.write(line + "\n")
 
 
@@ -409,7 +415,7 @@ async def _reverse(
 ) -> str:
     payer: HoldPayer
     if args.pay_with == "external":
-        payer = ExternalWalletPayer(write=_report)
+        payer = ExternalWalletPayer(write=_payment_prompt)
         decode_invoice = offline_invoice_decoder(network, crypto)
     else:
         payer = LndHoldPayer(
