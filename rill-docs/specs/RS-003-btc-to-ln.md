@@ -159,6 +159,32 @@ contract hash.
   output is unspent in its node's mempool or chain; the client could still
   double-spend the unconfirmed funding, so this risk is the provider's alone
   and the client's protections are unchanged.
+
+  A provider MAY also discover funding independently for an accepted contract,
+  without waiting for this message. Discovery MUST use its own node and an
+  affirmatively recorded, bounded watch established before the client can fund.
+  The provider-informational terms extension `rillswap/provider-funding-watch`
+  carries `{version: 1, from_height: N}`; clients MAY ignore it. Acceptance, not
+  the extension, supplies the client's contract consent. Missing watch state
+  MUST NOT trigger an automatic historical scan.
+
+  Independent admission requires exactly one observed contract-script output,
+  of the exact signed value, confirmed and unspent on the active chain at depth
+  at least `max(1, funding_confirmations)`. The provider MUST verify transaction
+  bytes against the contract, complete its bounded catch-up, and obtain fresh
+  own-node inclusion and unspent evidence before selecting it. Mempool-only
+  sightings, incomplete reads, ambiguous or duplicate deposits, and expired
+  payment bounds grant no independent payment authority. An unconfirmed
+  replacement is not selected. The zero-confirmation payment shortcut continues
+  to require a client-signed funding binding.
+
+  The selected record MUST be distinguishable from a client-signed binding;
+  providers MUST NOT synthesize a client signature or envelope. It enters the
+  same fresh funding, timing, and one-shot payment-dispatch gates. A later valid
+  revision-zero client binding for the exact selected transaction and output
+  MUST be acknowledged idempotently, without another payment grant. A different
+  transaction or output MUST be refused. Reorganization invalidates stale
+  funding evidence, never restores a consumed payment grant.
 - `observation` (provider, unsolicited): `payment_settled` carries the
   preimage the client can check against the payment hash. `payment_failed`
   says the provider will not pay, so the client waits for refund eligibility.

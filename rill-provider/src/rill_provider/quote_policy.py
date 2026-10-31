@@ -43,6 +43,7 @@ from rill_core.wire.reverse_quotes import (
     ReverseQuoteOffer,
 )
 
+from rill_provider.funding_discovery import WATCH_EXTENSION, WATCH_REORG_MARGIN_BLOCKS
 from rill_provider.live_session_store import Answer
 
 if TYPE_CHECKING:
@@ -183,6 +184,7 @@ class QuoteTerms:
     fee_policy: BtcFeePolicy | None = None
     fee_breakdown: FeeBreakdown | None = None
     dynamic: DynamicPricing | None = None  # balance-aware discounts, if configured
+    funding_watch: bool = False  # serving engine can monitor accepted Bitcoin deposits
 
 
 def _error(code: str, message: str) -> Answer:
@@ -443,7 +445,19 @@ def _firm(  # noqa: PLR0911 - one closed answer per rule
             ([COOPERATIVE_CLAIM_FEATURE] if context.cooperative else [])
             + ([FEE_POLICY_FEATURE] if context.network_fees else [])
         ),
-        "extensions": _fee_extensions(terms),
+        "extensions": {
+            **_fee_extensions(terms),
+            **(
+                {
+                    WATCH_EXTENSION: {
+                        "version": 1,
+                        "from_height": max(1, tip - WATCH_REORG_MARGIN_BLOCKS),
+                    }
+                }
+                if terms.funding_watch
+                else {}
+            ),
+        },
     }
     try:
         contract_terms = parse_model_json(ContractTerms, canonicalize(contract))

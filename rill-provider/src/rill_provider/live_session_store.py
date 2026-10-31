@@ -111,6 +111,16 @@ from rill_provider.core_tx_bytes import (
     CooperativeFeePolicy,
     ReverseSpendCheckpoint,
 )
+from rill_provider.funding_discovery import (
+    MAX_RECEIPTS,
+    MAX_SCAN_BLOCKS,
+    RECEIPT_FIELDS,
+    WATCH_EXTENSION,
+    FundingReceipt,
+    FundingScan,
+    FundingWatch,
+    ObservedFunding,
+)
 from rill_provider.handshake_store import HandshakePolicy, _expected, _features, _require_policy
 from rill_provider.issuance_reservation import _policy_bytes
 from rill_provider.lnd_hold_invoice import BoundHoldInvoiceObservation, HeldHtlc, HoldInvoiceStatus
@@ -153,7 +163,7 @@ if TYPE_CHECKING:
     from rill_provider.reverse_operations import ReverseOperation, ReverseOperations
 
 APPLICATION_ID = 0x524C5331  # RLS1, distinct from all diagnostic stores.
-SCHEMA_VERSION = 21  # every other version is refused: recreate with provision-store
+SCHEMA_VERSION = 22  # every other version is refused: drain, then explicitly provision a new store
 CONTRACT_KEY_RECORD_KIND = "rillswap-provider-contract-key"
 OPEN_PHASES = ("CONFIRMED", "ACCEPTED")  # sessions that may still send requests
 SWAP_TRANSITIONS = frozenset(
@@ -469,6 +479,14 @@ SCHEMA = (
         "session_id TEXT NOT NULL, reserved_at INTEGER NOT NULL)"
     ),
     PAYMENT_DISPATCH_SCHEMA,
+    (
+        "CREATE TABLE forward_funding (session_id TEXT PRIMARY KEY, floor_height INTEGER NOT NULL "
+        "CHECK (floor_height > 0), scanned_height INTEGER, scanned_block TEXT, "
+        "receipts BLOB NOT NULL, selected_binding BLOB, selected_transaction BLOB, "
+        "disabled INTEGER NOT NULL CHECK (disabled IN (0, 1)), "
+        "CHECK ((scanned_height IS NULL) = (scanned_block IS NULL)), "
+        "CHECK ((selected_binding IS NULL) = (selected_transaction IS NULL)))"
+    ),
     EPOCH_ADMISSION_SCHEMA,
     EPOCH_RETIREMENT_SCHEMA,
     EPOCH_KEY_HISTORY_SCHEMA,
@@ -786,6 +804,7 @@ class SwapRecord:
     funding_binding: bytes | None
     preimage: str | None
     claim_txid: str | None
+    observed_funding: ObservedFunding | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -841,6 +860,7 @@ class SettlementItem:
     funding_tx: bytes | None = None
     refund_txid: str | None = None
     refund_tx: bytes | None = None
+    observed_funding: ObservedFunding | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -884,8 +904,9 @@ class RecordedUnilateralClaim:
     txid: str
     fee_sat: int | None
     terms_offer: bytes
-    funding_binding: bytes
+    funding_binding: bytes | None
     preimage: str
+    observed_funding: ObservedFunding | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -962,6 +983,8 @@ class SwapInspection:
     preimage_recorded: bool
     claim_recorded: bool
     claim_txid: str | None
+    funding_source: str | None = None
+    funding_watch_recorded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -6029,7 +6052,12 @@ class LiveSessionStore:
                         else None,
                         spent_height,
                         spent_block,
-                        *provider_transactions,
+                        funding_txid=provider_transactions[0],
+                        funding_vout=provider_transactions[1],
+                        funding_tx=provider_transactions[2],
+                        refund_txid=provider_transactions[3],
+                        refund_tx=provider_transactions[4],
+                        observed_funding=_observed_funding(connection, session_id),
                     )
                     for (
                         session_id,
@@ -6054,6 +6082,110 @@ class LiveSessionStore:
         except Exception:  # noqa: BLE001 - never echo storage details
             raise LiveSessionStoreError("settlement work unavailable") from None
         return items
+
+    def funding_watch(self, session_id: str) -> FundingWatch | None:
+        """Read only an existing, enabled accepted-contract watch; never backfill one."""
+        with self._write() as connection:
+            return _funding_watch(connection, session_id)
+
+    def record_funding_scan(
+        self, session_id: str, expected: FundingWatch, scan: FundingScan
+    ) -> FundingWatch | None:
+        """Commit bounded progress and all confirmed receives before any adoption."""
+        with self._write() as connection:
+            if _funding_watch(connection, session_id) != expected:
+                raise StaleSwapError("funding watch changed")
+            start = expected.floor_height if expected.height is None else expected.height + 1
+            if not start - 1 <= scan.height <= min(
+                scan.tip_height, start + MAX_SCAN_BLOCKS - 1
+            ) or any(not start <= item.height <= scan.height for item in scan.receipts):
+                raise LiveSessionStoreError("funding scan bounds differ")
+            receipts = tuple(
+                sorted(
+                    {*expected.receipts, *scan.receipts},
+                    key=lambda item: (item.height, item.txid, item.vout),
+                )
+            )
+            terms = _offer_terms(
+                connection.execute(
+                    "SELECT terms_offer FROM swaps WHERE session_id=?", (session_id,)
+                ).fetchone()[0]
+            )
+            if len(receipts) > MAX_RECEIPTS or scan.tip_height >= terms.refund_lock_height:
+                connection.execute(
+                    "UPDATE forward_funding SET disabled=1 WHERE session_id=?", (session_id,)
+                )
+                return None
+            updated = FundingWatch(expected.floor_height, scan.height, scan.block_hash, receipts)
+            connection.execute(
+                "UPDATE forward_funding SET scanned_height=?,scanned_block=?,receipts=? "
+                "WHERE session_id=?",
+                (updated.height, updated.block_hash, _funding_receipts_bytes(receipts), session_id),
+            )
+            return updated
+
+    def reset_funding_watch(self, session_id: str, expected: FundingWatch) -> None:
+        """Rewind an orphaned checkpoint to its recorded floor, never to genesis."""
+        with self._write() as connection:
+            if _funding_watch(connection, session_id) != expected:
+                raise StaleSwapError("funding watch changed")
+            connection.execute(
+                "UPDATE forward_funding SET scanned_height=NULL,scanned_block=NULL,receipts=? "
+                "WHERE session_id=?",
+                (b"[]", session_id),
+            )
+
+    def disable_funding_watch(self, session_id: str) -> None:
+        """Saturated or expired discovery falls back to the signed-binding path."""
+        with self._write() as connection:
+            connection.execute(
+                "UPDATE forward_funding SET disabled=1 WHERE session_id=? "
+                "AND selected_binding IS NULL",
+                (session_id,),
+            )
+
+    def select_observed_funding(
+        self, session_id: str, expected: FundingWatch, observed: ObservedFunding, *, now: int
+    ) -> None:
+        """Select confirmed own-node funding atomically, without fabricating a client message.
+
+        The caller supplies fresh confirmation/unspent evidence. The store checks
+        the exact retained candidate, static bytes, deadline and conflict gate.
+        Neither selection nor an interrupted caller creates a payment grant.
+        """
+        with self._write() as connection:
+            if _funding_watch(connection, session_id) != expected or len(expected.receipts) != 1:
+                raise StaleSwapError("funding watch changed or ambiguous")
+            row = connection.execute(
+                "SELECT terms_offer FROM swaps WHERE session_id=?", (session_id,)
+            ).fetchone()
+            terms = _offer_terms(row[0])
+            binding = observed.binding
+            receipt = expected.receipts[0]
+            if (
+                terms.profile_id != "btc-to-ln/v1"
+                or now >= terms.invoice_binding.expires_at
+                or expected.height is None
+                or expected.height - receipt.height + 1 < max(1, terms.funding_confirmations)
+                or expected.height >= terms.refund_lock_height
+                or (binding.funding_txid, binding.contract_vout) != (receipt.txid, receipt.vout)
+            ):
+                raise LiveSessionStoreError("observed funding admission refused")
+            check_funding_binding_transaction(
+                observed.transaction,
+                binding,
+                terms,
+                keys=cast("TaprootKeyOperations", self._crypto),
+            )
+            connection.execute(
+                "UPDATE forward_funding SET selected_binding=?,selected_transaction=? "
+                "WHERE session_id=?",
+                (canonicalize(binding.model_dump(mode="json")), observed.transaction, session_id),
+            )
+            connection.execute(
+                "UPDATE swaps SET state='FUNDING_SEEN',updated_at=? WHERE session_id=?",
+                (now, session_id),
+            )
 
     def _commit_reverse_proposal_debt(  # noqa: PLR0912, PLR0913 - one atomic financial boundary
         self,
@@ -7588,7 +7720,20 @@ class LiveSessionStore:
                     "AND a.contract_hash=w.contract_hash)) " + selected + " ORDER BY w.session_id",
                     () if session_id is None else (session_id,),
                 ).fetchall()
-                return tuple(RecordedUnilateralClaim(*row) for row in rows)
+                return tuple(
+                    RecordedUnilateralClaim(
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3],
+                        row[4],
+                        row[5],
+                        row[6],
+                        row[7],
+                        _observed_funding(connection, row[0]),
+                    )
+                    for row in rows
+                )
         except LiveSessionStoreError:
             raise
         except Exception:  # noqa: BLE001 - no unverified selected bytes escape
@@ -8219,10 +8364,13 @@ class LiveSessionStore:
         try:
             with self._write() as connection:
                 rows = connection.execute(
-                    "SELECT w.session_id, w.contract_hash, w.state, s.session_id IS NOT NULL, "
+                    "SELECT w.session_id, w.contract_hash, w.state, s.session_id IS NOT NULL, "  # noqa: S608 - fixed predicate and bound parameters
                     "s.blocked, COALESCE(p.state, 'UNKNOWN'), p.request IS NOT NULL, "
                     "w.funding_binding IS NOT NULL, w.preimage IS NOT NULL, "
-                    "w.claim_tx IS NOT NULL, w.claim_txid "
+                    "w.claim_tx IS NOT NULL, w.claim_txid, "
+                    "EXISTS(SELECT 1 FROM forward_funding f WHERE f.session_id=w.session_id "
+                    "AND f.selected_binding IS NOT NULL), "
+                    "EXISTS(SELECT 1 FROM forward_funding f WHERE f.session_id=w.session_id) "
                     "FROM swaps w LEFT JOIN sessions s ON s.session_id=w.session_id "
                     "LEFT JOIN payment_dispatch p ON p.session_id=w.session_id WHERE "
                     + predicate
@@ -8243,6 +8391,8 @@ class LiveSessionStore:
                     preimage,
                     claim,
                     txid,
+                    provider_observed,
+                    watch_recorded,
                 ) = row
                 if not (
                     type(sid) is str
@@ -8278,6 +8428,10 @@ class LiveSessionStore:
                         bool(preimage),
                         bool(claim),
                         txid,
+                        "provider-observed"
+                        if provider_observed
+                        else ("client-signed" if funding else None),
+                        bool(watch_recorded),
                     )
                 )
         except LiveSessionStoreError:
@@ -8928,7 +9082,78 @@ def _swap(connection: sqlite3.Connection, session_id: str) -> SwapRecord | None:
         f"SELECT {SWAP_COLUMNS} FROM swaps WHERE session_id=?",  # noqa: S608 - fixed columns
         (session_id,),
     ).fetchone()
-    return None if row is None else SwapRecord(*row)
+    return (
+        None
+        if row is None
+        else SwapRecord(
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            row[6],
+            row[7],
+            _observed_funding(connection, session_id),
+        )
+    )
+
+
+def _observed_funding(connection: sqlite3.Connection, session_id: str) -> ObservedFunding | None:
+    row = connection.execute(
+        "SELECT selected_binding,selected_transaction FROM forward_funding WHERE session_id=?",
+        (session_id,),
+    ).fetchone()
+    if row is None or row == (None, None):
+        return None
+    if row[0] is None or type(row[1]) is not bytes or not 0 < len(row[1]) <= MAX_DOCUMENT_BYTES * 2:
+        raise LiveSessionStoreError("observed funding custody unavailable")
+    return ObservedFunding(parse_model_json(FundingBinding, row[0]), row[1])
+
+
+def _funding_receipts_bytes(receipts: tuple[FundingReceipt, ...]) -> bytes:
+    return canonicalize([[item.txid, item.vout, item.height, item.block_hash] for item in receipts])
+
+
+def _funding_watch(connection: sqlite3.Connection, session_id: str) -> FundingWatch | None:
+    row = connection.execute(
+        "SELECT f.floor_height,f.scanned_height,f.scanned_block,f.receipts,w.terms_offer "
+        "FROM forward_funding f JOIN swaps w ON w.session_id=f.session_id "
+        "JOIN sessions s ON s.session_id=w.session_id WHERE f.session_id=? "
+        "AND f.disabled=0 AND f.selected_binding IS NULL AND s.blocked=0 "
+        "AND w.state='ACCEPTED' AND w.funding_binding IS NULL",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    floor, height, block, raw, offer = row
+    terms = _offer_terms(offer)
+    marker = terms.extensions.get(WATCH_EXTENSION)
+    if (
+        terms.profile_id != "btc-to-ln/v1"
+        or not isinstance(marker, dict)
+        or marker != {"version": 1, "from_height": floor}
+    ):
+        raise LiveSessionStoreError("funding watch floor unavailable")
+    values = parse_json_strict(raw)
+    if not isinstance(values, list) or len(values) > MAX_RECEIPTS:
+        raise LiveSessionStoreError("funding watch receipts unavailable")
+    try:
+        receipts = tuple(
+            FundingReceipt(
+                cast("str", item[0]),
+                cast("int", item[1]),
+                cast("int", item[2]),
+                cast("str", item[3]),
+            )
+            for item in values
+            if isinstance(item, list) and len(item) == RECEIPT_FIELDS
+        )
+        if len(receipts) != len(values):
+            raise ValueError("funding watch receipts malformed")  # noqa: TRY301 - redact parsing
+        return FundingWatch(floor, height, block, receipts)
+    except (ValueError, TypeError):
+        raise LiveSessionStoreError("funding watch custody unavailable") from None
 
 
 def _record_ledger(  # noqa: PLR0913 - one row's explicit parts
@@ -9057,6 +9282,21 @@ def _apply_effect(
             (request.session_id, effect.contract_hash, replied[0], document, now),
         )
         economics = _offer_economics(replied[0])
+        accepted_terms = _offered_any_terms(replied[0])
+        marker = accepted_terms.extensions.get(WATCH_EXTENSION)
+        if (
+            accepted_terms.profile_id == "btc-to-ln/v1"
+            and isinstance(marker, dict)
+            and set(marker) == {"version", "from_height"}
+            and type(marker["version"]) is int
+            and marker["version"] == 1
+            and type(marker["from_height"]) is int
+            and marker["from_height"] > 0
+        ):
+            connection.execute(
+                "INSERT INTO forward_funding VALUES (?, ?, NULL, NULL, ?, NULL, NULL, 0)",
+                (request.session_id, marker["from_height"], b"[]"),
+            )
         _record_ledger(
             connection,
             request.session_id,

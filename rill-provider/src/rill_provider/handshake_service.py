@@ -1611,6 +1611,7 @@ class HandshakeService:
             profile=policy.profile,
             claim_fee=self._state.claim_fee,
             fee_policy=policy.fee_policy,
+            funding_watch=self._settlement is not None,
         )
         if policy.profile in EVM_PROFILES:
             evm = self._evm_settlement

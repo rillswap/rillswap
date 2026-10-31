@@ -34,7 +34,10 @@ import time
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol, TypeGuard
 
-from rill_core.settlement.funding import FundingBindingTransactionMatch
+from rill_core.settlement.funding import (
+    FundingBindingTransactionMatch,
+    check_funding_binding_transaction,
+)
 from rill_core.settlement.taproot import reconstruct_taproot_contract
 from rill_core.settlement.unilateral import (
     FundingOutput,
@@ -53,7 +56,7 @@ from rill_core.settlement.unilateral import (
 from rill_core.wire.canonical import canonicalize, parse_json_strict, parse_model_json
 from rill_core.wire.fee_policy import FEE_POLICY_EXTENSION, FeeBreakdown
 from rill_core.wire.hashes import COOPERATIVE_CLAIM_FEATURE, FEE_POLICY_FEATURE, contract_hash
-from rill_core.wire.messages import Envelope
+from rill_core.wire.messages import Envelope, FundingBinding
 from rill_core.wire.settlement_messages import FundingBindingPayload
 
 from rill_provider.core_tx_bytes import (
@@ -63,7 +66,11 @@ from rill_provider.core_tx_bytes import (
     CoreReadError,
     CoreTransactionUnknownError,
 )
-from rill_provider.diagnostics import diagnostic_context
+from rill_provider.diagnostics import diagnostic, diagnostic_context
+from rill_provider.funding_discovery import (
+    FundingDiscoveryOverflowError,
+    ObservedFunding,
+)
 from rill_provider.live_session_store import (
     MAX_CLAIM_ATTEMPTS,
     CooperativeClaimObservation,
@@ -86,14 +93,16 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from rill_core.settlement.taproot import TaprootKeyOperations
-    from rill_core.wire.messages import ContractTerms, FundingBinding, InvoiceBinding
+    from rill_core.wire.messages import ContractTerms, InvoiceBinding
 
     from rill_provider.core_tx_bytes import (
         CandidateFundingOutpoint,
+        CoreHistoricalTransaction,
         FundedOutput,
         MempoolFundingOutpoint,
         SpendScan,
     )
+    from rill_provider.funding_discovery import FundingScan
     from rill_provider.live_session_store import (
         ClaimAttempt,
         LiveSessionStore,
@@ -111,6 +120,18 @@ class ChainBackend(Protocol):
 
     def tip_height(self) -> int:
         """Return the validated tip height."""
+        ...
+
+    def discover_funding(
+        self, script: bytes, *, from_height: int, anchor_block: str | None = None
+    ) -> FundingScan:
+        """Read a bounded explicit block range and the mempool for one script."""
+        ...
+
+    def observe_block_transaction(
+        self, txid: str, *, block_height: int, block_hash: str, deadline_seconds: float = 10
+    ) -> CoreHistoricalTransaction:
+        """Read exact transaction bytes from a known active block."""
         ...
 
     def observe_candidate_outpoint(
@@ -313,6 +334,9 @@ class SettlementEngine:
         self._claim_probes: dict[str, ClaimProbeWindow] = {}
         self._conflict_scans: dict[str, _ConflictScan] = {}
         self._cooperative_sample_task: asyncio.Task[object] | None = None
+        self._discovery_session: str | None = None
+        self._last_discovery_session = ""
+        self._discovery_notices: dict[str, str] = {}
         # Latest usable claim fee evidence per signed confirmation target, for
         # claims that must be signed without waiting on Core (memory only).
         self._claim_fee_evidence: dict[int, CooperativeFeePolicy] = {}
@@ -890,13 +914,20 @@ class SettlementEngine:
 
     def _validate_recorded_unilateral(self, claim: RecordedUnilateralClaim) -> None:
         terms = offered_terms(Envelope.model_validate_json(claim.terms_offer, strict=True))
-        funding = Envelope.model_validate_json(claim.funding_binding, strict=True)
-        binding = parse_model_json(FundingBindingPayload, canonicalize(funding.payload)).binding
+        if claim.observed_funding is not None:
+            binding = claim.observed_funding.binding
+            check_funding_binding_transaction(
+                claim.observed_funding.transaction, binding, terms, keys=self._crypto
+            )
+        else:
+            funding = Envelope.model_validate_json(claim.funding_binding or b"", strict=True)
+            if funding.contract_hash != claim.contract_hash:
+                raise LiveSessionStoreError("recorded unilateral envelope mismatch")
+            binding = parse_model_json(FundingBindingPayload, canonicalize(funding.payload)).binding
         if (
             terms.profile_id != "btc-to-ln/v1"
             or terms.network_identity != self._store.network_identity
             or contract_hash(terms).hex() != claim.contract_hash
-            or funding.contract_hash != claim.contract_hash
             or binding.contract_hash != claim.contract_hash
             or hashlib.sha256(bytes.fromhex(claim.preimage)).hexdigest()
             != terms.invoice_binding.payment_hash
@@ -1067,6 +1098,20 @@ class SettlementEngine:
         """Advance each swap at most through its available steps; return new states."""
         results: dict[str, str] = {}
         work = self._store.settlement_work()
+        watching = sorted(
+            item.session_id
+            for item in work
+            if item.state == "ACCEPTED"
+            and item.funding_binding is None
+            and item.observed_funding is None
+            and not item.blocked
+        )
+        self._discovery_session = next(
+            (sid for sid in watching if sid > self._last_discovery_session),
+            watching[0] if watching else None,
+        )
+        if self._discovery_session is not None:
+            self._last_discovery_session = self._discovery_session
         self._diagnostic_waiting = {
             item.session_id: self._diagnostic_waiting[item.session_id]
             for item in work
@@ -1181,17 +1226,20 @@ class SettlementEngine:
         terms = offered_terms(Envelope.model_validate_json(item.terms_offer, strict=True))
         if terms.profile_id == "ln-to-btc/v1":
             return item.state if self._reverse is None else await self._reverse.advance(item, now)
-        if item.funding_binding is None:
-            return item.state  # ACCEPTED: awaiting the client's funding binding
-        funding = Envelope.model_validate_json(item.funding_binding, strict=True)
-        binding = parse_model_json(FundingBindingPayload, canonicalize(funding.payload)).binding
+        if item.funding_binding is None and item.observed_funding is None:
+            if item.state == "ACCEPTED" and item.session_id == self._discovery_session:
+                return await self._discover_funding(item, terms, now)
+            return item.state
+        binding = _item_binding(item)
         invoice = terms.invoice_binding
         timing = terms.timing_policy.model_dump()
         expiry_height = int(timing["max_outgoing_htlc_expiry_height"])
         if item.state == "FUNDING_SEEN":
             if item.blocked or not self._new_exposure_allowed:
                 return item.state
-            funded_tip = await self._funded_tip(binding, terms)
+            funded_tip = await self._funded_tip(
+                binding, terms, confirmed_only=item.observed_funding is not None
+            )
             if funded_tip is None:
                 return item.state
             if (
@@ -1445,7 +1493,10 @@ class SettlementEngine:
             # A cooperative probe may follow; its fallback is signed without
             # waiting on Core, so remember fee evidence before paying.
             await self._sample_claim_fee(terms)
-        if await self._funded_tip(binding, terms) is None:
+        if (
+            await self._funded_tip(binding, terms, confirmed_only=item.observed_funding is not None)
+            is None
+        ):
             return outcome
         if now >= invoice.expires_at or (
             hashlib.sha256(item.invoice.encode("ascii")).hexdigest() != invoice.bolt11_sha256
@@ -1488,14 +1539,16 @@ class SettlementEngine:
                 if not self._new_exposure_allowed or time.monotonic() >= deadline:
                     raise
 
-    async def _funded_tip(self, binding: FundingBinding, terms: ContractTerms) -> int | None:
+    async def _funded_tip(
+        self, binding: FundingBinding, terms: ContractTerms, *, confirmed_only: bool = False
+    ) -> int | None:
         """Return the sampled tip once the funding meets the signed depth, else None.
 
         Zero-confirmation terms pay on the output being unspent in the node's
         mempool view: the provider announced that it accepts the client's
         double-spend risk. Every other depth needs confirmed chain evidence.
         """
-        if terms.funding_confirmations == 0:
+        if terms.funding_confirmations == 0 and not confirmed_only:
             mempool = await asyncio.to_thread(
                 self._chain.observe_mempool_outpoint, binding, terms, keys=self._crypto
             )
@@ -1503,9 +1556,109 @@ class SettlementEngine:
         seen = await asyncio.to_thread(
             self._chain.observe_candidate_outpoint, binding, terms, keys=self._crypto
         )
-        if seen.chain_only_confirmations < terms.funding_confirmations:
+        if seen.chain_only_confirmations < max(1, terms.funding_confirmations):
             return None
         return seen.tip_height
+
+    async def _discover_funding(  # noqa: PLR0911 - ordered observation/admission gates
+        self, item: SettlementItem, terms: ContractTerms, now: int
+    ) -> str:
+        """Observe one affirmatively watched swap per tick, with bounded fair catch-up."""
+        if (
+            item.blocked
+            or not self._new_exposure_allowed
+            or now >= terms.invoice_binding.expires_at
+        ):
+            return item.state
+        watch = self._store.funding_watch(item.session_id)
+        if watch is None:
+            return item.state  # unknown/legacy state is never a reason to scan
+        script = reconstruct_taproot_contract(terms, keys=self._crypto).script_pubkey
+        start = watch.floor_height if watch.height is None else watch.height + 1
+        try:
+            scan = await asyncio.to_thread(
+                lambda: self._chain.discover_funding(
+                    script, from_height=start, anchor_block=watch.block_hash
+                )
+            )
+        except FundingDiscoveryOverflowError:
+            self._store.disable_funding_watch(item.session_id)
+            self._discovery_notice(item.session_id, "saturated")
+            return item.state
+        except CoreProtocolError:
+            # Retained candidates may belong to the orphaned branch too. Rewind
+            # both together. A selected candidate never comes through this path:
+            # its fresh funding checks prevent exposure without deleting history.
+            if watch.height is not None:
+                self._store.reset_funding_watch(item.session_id, watch)
+            raise
+        updated = self._store.record_funding_scan(item.session_id, watch, scan)
+        if updated is None:
+            self._discovery_notice(item.session_id, "disabled")
+            return item.state
+        reason = "mempool_seen" if scan.mempool_seen else "awaiting_deposit"
+        if len(updated.receipts) > 1:
+            reason = "ambiguous_deposits"
+        self._discovery_notice(item.session_id, reason)
+        if updated.height != scan.tip_height or len(updated.receipts) != 1 or scan.mempool_seen:
+            # An additional unconfirmed receive is extra exposure too. Do not
+            # reveal the common preimage while independent selection is ambiguous.
+            return item.state
+        receipt = updated.receipts[0]
+        if scan.tip_height - receipt.height + 1 < max(1, terms.funding_confirmations):
+            return item.state
+        historical = await asyncio.to_thread(
+            lambda: self._chain.observe_block_transaction(
+                receipt.txid, block_height=receipt.height, block_hash=receipt.block_hash
+            )
+        )
+        raw = historical.raw_transaction
+        txid, inputs = await asyncio.to_thread(self._chain.transaction_inputs, raw)
+        if txid != receipt.txid or not inputs:
+            raise CoreProtocolError("discovered funding bytes differ")
+        binding = FundingBinding(
+            contract_hash=contract_hash(terms).hex(),
+            funding_attempt_id=hashlib.sha256(
+                b"rillswap/provider-observed/v1" + bytes.fromhex(txid)
+            ).hexdigest(),
+            binding_revision=0,
+            funder_role="client",
+            lineage_anchor_txid=inputs[0][0],
+            lineage_anchor_vout=inputs[0][1],
+            funding_txid=txid,
+            contract_vout=receipt.vout,
+            contract_value_sat=terms.economics.contract_amount_sat,
+            contract_script_pubkey=script.hex(),
+            replaces_txid=None,
+            created_at=now,
+        )
+        confirmed = await asyncio.to_thread(
+            lambda: self._chain.observe_candidate_outpoint(binding, terms, keys=self._crypto)
+        )
+        if (
+            confirmed.chain_only_confirmations < max(1, terms.funding_confirmations)
+            or confirmed.tip_hash != scan.tip_hash
+            or confirmed.tip_height != scan.tip_height
+            or confirmed.inclusion_block_hash != receipt.block_hash
+            or confirmed.inclusion_height != receipt.height
+        ):
+            return item.state
+        self._store.select_observed_funding(
+            item.session_id, updated, ObservedFunding(binding, raw), now=now
+        )
+        self._discovery_notice(item.session_id, "confirmed_funding_selected")
+        return "FUNDING_SEEN"
+
+    def _discovery_notice(self, session_id: str, reason: str) -> None:
+        if self._discovery_notices.get(session_id) != reason:
+            diagnostic(
+                LOG,
+                "funding.discovery",
+                "Provider deposit observation",
+                session_id=session_id,
+                reason=reason,
+            )
+            self._discovery_notices[session_id] = reason
 
     async def _maybe_lost(
         self,
@@ -1608,12 +1761,17 @@ class SettlementEngine:
         self, item: SettlementItem, binding: FundingBinding, tip: int
     ) -> _ConflictScan | None:
         try:
-            envelope = Envelope.model_validate_json(item.funding_binding or b"", strict=True)
-            payload = parse_model_json(FundingBindingPayload, canonicalize(envelope.payload))
-            raw = bytes.fromhex(payload.funding_transaction)
+            if item.observed_funding is not None:
+                raw = item.observed_funding.transaction
+                retained_binding = item.observed_funding.binding
+            else:
+                envelope = Envelope.model_validate_json(item.funding_binding or b"", strict=True)
+                payload = parse_model_json(FundingBindingPayload, canonicalize(envelope.payload))
+                raw = bytes.fromhex(payload.funding_transaction)
+                retained_binding = payload.binding
         except Exception:  # noqa: BLE001 - an unreadable binding names no inputs: no evidence
             return None
-        if payload.binding.funding_txid != binding.funding_txid:
+        if retained_binding.funding_txid != binding.funding_txid:
             return None
         txid, inputs = await asyncio.to_thread(self._chain.transaction_inputs, raw)
         if txid != binding.funding_txid:
@@ -1778,6 +1936,13 @@ class SettlementEngine:
             item.session_id, plan.signature_hash, self._crypto
         )
         return finalize_unilateral_spend(plan, signature, verifier=self._crypto)
+
+
+def _item_binding(item: SettlementItem) -> FundingBinding:
+    if item.observed_funding is not None:
+        return item.observed_funding.binding
+    funding = Envelope.model_validate_json(item.funding_binding or b"", strict=True)
+    return parse_model_json(FundingBindingPayload, canonicalize(funding.payload)).binding
 
 
 def _fee_policy_usable(

@@ -34,6 +34,13 @@ from rill_core.settlement import (
 from rill_core.wire.messages import ContractTerms, FundingBinding
 from rill_core.wire.types import NetworkIdentity
 
+from rill_provider.funding_discovery import (
+    MAX_RECEIPTS,
+    MAX_SCAN_BLOCKS,
+    FundingDiscoveryOverflowError,
+    FundingReceipt,
+    FundingScan,
+)
 from rill_provider.funding_selection import INPUT_WEIGHTS, Coin, input_kind, select_funding_inputs
 
 if TYPE_CHECKING:
@@ -72,6 +79,7 @@ MAX_SATS = 21_000_000 * 100_000_000
 # provider's Core credential to exactly this list with -rpcwhitelist.
 CORE_RPC_METHODS = (
     "getblockchaininfo",
+    "getdescriptoractivity",
     "estimatesmartfee",
     "getmempoolinfo",
     "getblockhash",
@@ -1134,6 +1142,100 @@ class CoreTransactionReader:
             trust_env=False,
             follow_redirects=False,
             timeout=httpx.Timeout(READ_SECONDS, connect=CONNECT_SECONDS),
+        )
+
+    def discover_funding(  # noqa: PLR0912 - bounded descriptor response validation
+        self, script: bytes, *, from_height: int, anchor_block: str | None = None
+    ) -> FundingScan:
+        """Read at most twelve explicit blocks plus mempool, never import or rescan.
+
+        The caller must already have a durable affirmative watch. A changed
+        checkpoint or tip yields no progress and never means an empty address.
+        Receives are retained even if subsequently spent, to expose duplicates.
+        """
+        if (
+            type(script) is not bytes
+            or len(script) != 34  # noqa: PLR2004 - Taproot output script
+            or script[:2] != b"\x51\x20"
+            or type(from_height) is not int
+            or from_height < 1
+            or (anchor_block is not None and not _hash(anchor_block))
+        ):
+            raise ValueError("funding discovery bounds unsupported")
+        deadline = time.monotonic() + READ_SECONDS
+        try:
+            with self._client() as client:
+                tip_hash, tip = _chain_tip(
+                    self._rpc(client, "getblockchaininfo", [], 1, deadline=deadline), self._network
+                )
+                if (
+                    self._rpc(client, "getblockhash", [0], 2, deadline=deadline)
+                    != self._network.genesis_hash
+                ):
+                    raise CoreProtocolError("Core genesis differs from configuration")
+                if from_height > tip + 1:
+                    raise CoreProtocolError("funding discovery checkpoint above tip")
+                before = self._rpc(client, "getblockhash", [from_height - 1], 3, deadline=deadline)
+                if not _hash(before) or (anchor_block is not None and before != anchor_block):
+                    raise CoreProtocolError("funding discovery checkpoint left active chain")
+                stop = min(tip, from_height + MAX_SCAN_BLOCKS - 1)
+                hashes = [
+                    self._rpc(client, "getblockhash", [height], 4, deadline=deadline)
+                    for height in range(from_height, stop + 1)
+                ]
+                if not all(_hash(value) for value in hashes):
+                    raise CoreProtocolError("funding discovery block unavailable")
+                result = self._rpc(
+                    client,
+                    "getdescriptoractivity",
+                    [hashes, [f"raw({script.hex()})"], True],
+                    5,
+                    deadline=deadline,
+                )
+                if not isinstance(result, dict) or not isinstance(result.get("activity"), list):
+                    raise CoreProtocolError("funding discovery activity unavailable")
+                if len(result["activity"]) > MAX_RECEIPTS * 2:
+                    raise FundingDiscoveryOverflowError("funding discovery saturated")
+                receipts: set[FundingReceipt] = set()
+                mempool_seen = False
+                for event in result["activity"]:
+                    if not isinstance(event, dict) or event.get("type") not in {"receive", "spend"}:
+                        raise CoreProtocolError("funding discovery event unsupported")
+                    if event["type"] == "spend":
+                        continue
+                    if (
+                        not _hash(event.get("txid"))
+                        or type(event.get("vout")) is not int
+                        or not 0 <= event["vout"] <= MAX_VOUT
+                        or not isinstance(event.get("output_spk"), dict)
+                        or event["output_spk"].get("hex") != script.hex()
+                    ):
+                        raise CoreProtocolError("funding discovery receive unsupported")
+                    height, block = event.get("height"), event.get("blockhash")
+                    if height is None and block is None:
+                        mempool_seen = True
+                        continue
+                    if (
+                        type(height) is not int
+                        or not from_height <= height <= stop
+                        or block != hashes[height - from_height]
+                    ):
+                        raise CoreProtocolError("funding discovery inclusion differs")
+                    receipts.add(FundingReceipt(event["txid"], event["vout"], height, block))
+                end = _chain_tip(
+                    self._rpc(client, "getblockchaininfo", [], 6, deadline=deadline), self._network
+                )
+                if end != (tip_hash, tip):
+                    raise CoreUnavailableError("funding discovery chain changed")
+        except httpx.HTTPError:
+            raise CoreUnavailableError("funding discovery transport unavailable") from None
+        return FundingScan(
+            tip,
+            tip_hash,
+            stop,
+            hashes[-1] if hashes else str(before),
+            tuple(sorted(receipts, key=lambda item: (item.height, item.txid, item.vout))),
+            mempool_seen,
         )
 
     def broadcast(self, raw: bytes, txid: str) -> str:

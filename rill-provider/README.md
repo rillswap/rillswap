@@ -883,9 +883,9 @@ v20 store never granted a rebate, so draining it and provisioning a new store
 (below) loses no rebate history.
 
 Stop the service before installing a new version. Stores are never upgraded in
-place. A store of any other schema version (including v20 and earlier) is
+place. A store of any other schema version (including v21 and earlier) is
 refused with its contents unchanged, with
-`live session store version unsupported (found N, requires 21); recreate it with
+`live session store version unsupported (found N, requires 22); recreate it with
 provision-store`. (If the old process crashed, SQLite may still fold its
 committed write-ahead log into the database file; nothing is lost.) An older
 release also refuses a newer store.
@@ -905,6 +905,46 @@ cooperative claims (`cooperative-claim/v1`). A configuration that still sets
 `handshake.features` is refused; delete that key.
 
 ## Operations and recovery
+
+### Deposits and container restarts
+
+New BTC to LN offers record an informational
+`rillswap/provider-funding-watch` extension with a starting height 12 blocks
+before the quote tip (or height 1), allowing bounded catch-up across shallow
+reorganizations. Deeper reorganizations can require the client's signed binding.
+Acceptance atomically records its watch before the funding prompt can be used.
+The provider checks its own Core node for these deposits, even if the client
+closes before sending a funding binding. It notices mempool deposits without
+waiting for the browser, but independently selects only a unique confirmed,
+exact-value deposit at `max(1, funding_confirmations)` confirmations. Existing
+client-signed zero-confirmation bindings keep their previous behavior.
+
+Each observation reads at most 12 explicit blocks plus the mempool, with a
+five-second RPC budget. One waiting swap is observed per service tick in fair
+rotation. Progress and confirmed receive history survive a container restart;
+an orphaned checkpoint rewinds only to the recorded quote height. This does not
+import descriptors, rescan a wallet, or scan the UTXO set. Missing watch records
+do not create automatic scanning work. More than 16 receives or reaching the
+refund height disables independent discovery; the client-signed binding path
+remains available. Ambiguous deposits never select an outpoint automatically.
+An additional unconfirmed receive also defers independent selection, rather
+than revealing the common preimage while that extra deposit remains exposed.
+
+Core 30 or later and `getdescriptoractivity` permission are required for this
+fallback. Add it to an older operator `rpcwhitelist` before enabling the new
+release. Without the permission, discovery is deferred and logged; ordinary
+signed bindings and already-running settlement keep their existing behavior.
+No explorer service is contacted. `inspect-swaps` identifies the funding source
+as `provider-observed` or `client-signed` and reports whether a watch exists.
+
+Schema v22 adds these durable watch and provider-observed funding records.
+Existing v21 installations are refused unchanged, not automatically migrated.
+Finish or independently recover their open swaps on the old release, then use
+the explicit drain-and-new-store upgrade procedure above. No existing swap is
+silently imported into another store. Restarting a compatible v22 installation
+resumes its existing watches, payment tracking and claim handling without a new
+client instruction. Restart cannot extend an invoice or chain deadline, and
+unknown Lightning outcomes never authorize a resend.
 
 After a crash, preserve the store and credentials, and confirm the previous
 process has stopped before restarting or running an offline command. Do not

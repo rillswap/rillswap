@@ -41,7 +41,7 @@ def _error(code: str, message: str) -> Answer:
     return Answer("error", {"code": code, "message": message})
 
 
-def _ack(request: Envelope, contract: str, effect: AcceptSwap | BindFunding) -> Answer:
+def _ack(request: Envelope, contract: str, effect: AcceptSwap | BindFunding | None) -> Answer:
     return Answer(
         "ack",
         {"acknowledged_message_id": request.message_id},
@@ -132,7 +132,10 @@ def answer_funding(
     confirmations are checked later, from the provider's own node.
     """
     swap = context.swap
-    if swap is None or swap.state != "ACCEPTED" or swap.funding_binding is not None:
+    if swap is None or (
+        swap.observed_funding is None
+        and (swap.state != "ACCEPTED" or swap.funding_binding is not None)
+    ):
         return _error("unsupported_request", "no accepted contract awaiting funding")
     if request.in_reply_to is not None or request.contract_hash != swap.contract_hash:
         return _error("request_unacceptable", "binding names another contract")
@@ -150,6 +153,14 @@ def answer_funding(
         check_funding_binding_transaction(
             bytes.fromhex(payload.funding_transaction), binding, terms, keys=crypto
         )
+        if swap.observed_funding is not None:
+            selected = swap.observed_funding
+            if (binding.funding_txid, binding.contract_vout) != (
+                selected.binding.funding_txid,
+                selected.binding.contract_vout,
+            ) or bytes.fromhex(payload.funding_transaction) != selected.transaction:
+                raise ValueError("binding differs from observed funding")  # noqa: TRY301 - redact
+            return _ack(request, swap.contract_hash, None)
     except Exception:  # noqa: BLE001 - no parsing or signature oracle
         return _error("request_unacceptable", "funding binding refused")
     return _ack(request, swap.contract_hash, BindFunding())
