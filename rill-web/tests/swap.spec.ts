@@ -52,10 +52,16 @@ test("direction flips between Bitcoin and Lightning, and stablecoins pair with L
   await expect(page.locator("#swap-pair-note")).not.toBeVisible();
   await expect(page.locator("#swap-start")).toBeEnabled();
 
+  await page.locator("#swap-recovery-timing-help summary").click();
+  await expect(page.locator("#swap-recovery-timing-help")).toContainText("your refund after 288 Bitcoin blocks");
+  await expect(page.locator("#swap-recovery-timing-help")).toContainText("about 2,880 min / 48 h");
+
   await page.getByRole("button", { name: "Switch direction" }).click();
   await expect(page.locator("#swap-from")).toHaveValue("ln");
   await expect(page.locator("#swap-to")).toHaveValue("btc");
   await expect(page.getByRole("heading", { name: "Lightning in. Bitcoin out." })).toBeVisible();
+  await expect(page.locator("#swap-recovery-timing-help")).toContainText("provider refund after 144 Bitcoin blocks");
+  await expect(page.locator("#swap-recovery-timing-help")).toContainText("minimum incoming Lightning expiry delta is 185 blocks");
   await expect(page.locator("#swap-invoice")).not.toBeVisible();
   await expect(page.locator("#swap-recovery-toggle")).toBeVisible(); // the recovery key serves both directions
   await expect(page.locator("#swap-forward-overrides")).not.toBeVisible();
@@ -81,6 +87,8 @@ test("direction flips between Bitcoin and Lightning, and stablecoins pair with L
   await page.locator("#swap-from").selectOption("usdc");
   await page.locator("#swap-to").selectOption("ln");
   await expect(page.getByRole("heading", { name: "USD Coin in. Lightning out." })).toBeVisible();
+  await expect(page.locator("#swap-recovery-timing-help")).toContainText("The provider claims after paying Lightning");
+  await expect(page.locator("#swap-recovery-timing-help")).toContainText("no universal default");
   await expect(page.locator("#swap-pair-note")).not.toBeVisible();
   await expect(page.locator("#swap-invoice")).toBeVisible();
   await expect(page.locator("#swap-forward-overrides")).not.toBeVisible();
@@ -93,6 +101,8 @@ test("direction flips between Bitcoin and Lightning, and stablecoins pair with L
   await expect(page.locator("#swap-receive-amount")).toBeVisible();
   await expect(page.locator("#swap-receive-address")).not.toBeVisible();
   await expect(page.locator('label[for="swap-receive-amount"]')).toHaveText("Amount to receive (USDC)");
+  await expect(page.locator("#swap-recovery-timing-help")).toContainText("You claim once the provider's funding passes verification");
+  await expect(page.locator("#swap-recovery-timing-help")).toContainText("invoice payment expiries are separate");
   // A configured gas sponsor turns receiving into "amount plus address": no wallet extension, no gas.
   await openSettings(page, "evm");
   await page.locator("#swap-evm-sponsor").fill("http://127.0.0.1:8094");

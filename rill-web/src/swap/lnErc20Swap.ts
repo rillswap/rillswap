@@ -294,13 +294,18 @@ async function prepareFirm(relay: RelayLink, request: LnErc20Request, options: {
   } catch (error) { session.secret.fill(0); throw error; }
 }
 
+/** Shared with advisory UI so the displayed cutoff cannot drift from the disclosure guard. */
+export function evmClaimMarginBlocks(terms: Pick<LnToErc20Terms, "settlement_confirmations" | "evm_asset">): number {
+  return Math.max(terms.settlement_confirmations + 12, Math.ceil(600 / terms.evm_asset.block_seconds));
+}
+
 /** No claim calldata is sent during these checks: even eth_estimateGas would leak the preimage. */
 export async function assertSafeEvmClaim(rpc: EvmRpc, terms: LnToErc20Terms, preimage: string, claimGas: "wallet" | "sponsored" = "wallet"): Promise<{ readonly checkedAt: number }> {
   if (!/^[0-9a-f]{64}$/.test(preimage) || bytesToHex(sha256(hexToBytes(preimage))) !== terms.invoice_binding.payment_hash) throw new SwapError("claim preimage mismatch");
   if (await rpc.chainId() !== terms.evm_asset.chain_id) throw new SwapError("wrong EVM RPC chain");
   await rpc.verifyHtlc(terms.evm_asset.htlc_contract);
   const tip = await rpc.blockNumber(), lock = lockOf(terms);
-  const margin = Math.max(terms.settlement_confirmations + 12, Math.ceil(600 / terms.evm_asset.block_seconds));
+  const margin = evmClaimMarginBlocks(terms);
   if (tip + margin >= lock.timelock) throw new SwapError("Too close to the provider's refund block to reveal the preimage safely");
   const logs = await rpc.findLockups(terms.evm_asset.htlc_contract, lock.preimageHash, Math.max(0, terms.evm_reference_block - 12), tip);
   if (!logs.some((log) => lockHash(log.lock) === lockHash(lock) && tip - log.blockNumber + 1 >= terms.funding_confirmations) ||

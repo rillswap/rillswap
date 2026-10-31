@@ -45,6 +45,7 @@ import { decryptRecoveryContainer } from "./recoveryKeys";
 import { requestSwapNotifications, notifyActivity } from "./swap/notifications";
 import { ActivityHistory, activityStatus, logText, type ActivityFacts, type ActivityObserver } from "./swap/activity";
 import { pageModuleUrl, publishedVersion } from "./publishedVersion";
+import { expiryDatetime, recoveryDefaults, recoveryTiming, reverseQuoteRecoveryTiming, type ChainObservation } from "./recoveryTiming";
 
 const NETWORKS = { mainnet, signet, testnet4, regtest } as const;
 /** How often an idle, visible page reloads the provider directory. */
@@ -58,6 +59,13 @@ const providerFeeDetails = (fee?: FeeBreakdown): string => fee
 function timeDetails(text: string): HTMLDetailsElement {
   const details = node("details");
   details.append(node("summary", "Time estimate assumptions"), node("small", text));
+  return details;
+}
+
+function reverseRecoveryDetails(input: Parameters<typeof reverseQuoteRecoveryTiming>[0]): HTMLElement {
+  const timing = reverseQuoteRecoveryTiming(input), details = node("span");
+  details.className = "swap-recovery-timing";
+  details.append(...timing.badges.map((text) => Object.assign(node("span", text), { className: "swap-offer-tag timeout" })), node("small", timing.text));
   return details;
 }
 
@@ -463,6 +471,9 @@ function mount(root: HTMLElement): void {
   };
   invoice.oninput = receiveAmount.oninput = updateEstimate;
   form.append(invoiceBox, receiveBox, estimate);
+  const recoveryHelp = node("details", "", "swap-recovery-timing-help"), recoveryHelpText = node("p");
+  recoveryHelp.append(node("summary", "Recovery timing & defaults"), recoveryHelpText);
+  form.append(recoveryHelp);
   const keyRecommendation = node("p", "", "swap-key-recommendation");
   const backupKey = node("button", "Back up your recovery key", "swap-key-backup");
   backupKey.type = "button";
@@ -747,6 +758,8 @@ function mount(root: HTMLElement): void {
   updateDisclosure();
   const updateNetwork = (): void => {
     const route = routeFor(fromAsset.value, toAsset.value);
+    recoveryHelp.hidden = route.profile === null;
+    recoveryHelpText.textContent = route.profile ? recoveryDefaults(route.profile) : "";
     if (!busy && tracking.hidden) {
       intro.hidden = form.hidden = cardHead.hidden = false;
       delete card.dataset.review;
@@ -1038,7 +1051,8 @@ function mount(root: HTMLElement): void {
         const { wallet, account } = await connectEvmWallet(rpc, asset);
         assertCurrent();
         report(`wallet ${account} connected on chain ${asset.chain_id}`);
-        const evmTip = await rpc.blockNumber();
+        const observedAt = Date.now(), evmTip = await rpc.blockNumber();
+        const observation = { height: evmTip, observedAt };
         assertCurrent();
         const request: Omit<Erc20SwapRequest, "identity"> = {
           network: NETWORKS[name], invoice: invoice.value.trim(), asset, clientEvmAddress: account, evmTip, ageRecipient: "",
@@ -1063,7 +1077,9 @@ function mount(root: HTMLElement): void {
             node("p", `Pays your ${principal.toLocaleString()} sat invoice at ${tokenLabel(quote.rateTokenBasePerBtc, asset)} per BTC. ` +
               `${signedFeeText("Provider", quote.successFeeTokenBase, (value) => tokenLabel(value, asset))}. Your wallet's gas is extra.`),
             node("small", `The provider pays after ${quote.fundingConfirmations} EVM block confirmation${quote.fundingConfirmations === 1 ? "" : "s"} of your lock. ` +
-              `Refundable from EVM block ${quote.timelockBlock} if the provider never pays. Offer expires ${new Date(quote.expiresAt * 1000).toLocaleTimeString()}.`));
+              `Offer acceptance expires ${expiryDatetime(quote.expiresAt)}.`),
+            node("small", recoveryTiming({ profile: "erc20-to-ln/v1", network: name, refundLockHeight: quote.timelockBlock,
+              blockSeconds: asset.block_seconds, observation }), "swap-quote-recovery-time"));
         };
         showQuote();
         review.append(quoteSummary, priceClaim, node("small", "Signatures authenticate offers, not provider reputation."));
@@ -1078,7 +1094,9 @@ function mount(root: HTMLElement): void {
           option.type = "radio"; option.name = "verified-provider"; option.checked = index === 0;
           option.onchange = () => { selected = quote; showQuote(); };
           label.append(option, node("span", `${tokenLabel(quote.prepared.quote.lockAmountTokenBase, asset)} · ${quote.prepared.quote.providerIdentity.slice(0, 12)}…`),
-            ...tags(quote), node("small", `Transport: ${quote.relayUrl}; identity: ${quote.prepared.quote.providerIdentity}`));
+            ...tags(quote), Object.assign(node("span", "Provider-set timeout"), { className: "swap-offer-tag timeout" }),
+            node("small", recoveryTiming({ profile: "erc20-to-ln/v1", network: name, refundLockHeight: quote.prepared.quote.timelockBlock,
+              blockSeconds: asset.block_seconds, observation })), node("small", `Transport: ${quote.relayUrl}; identity: ${quote.prepared.quote.providerIdentity}`));
           offers.append(label);
         }
         const accept = node("button", "Swap with this quote", "swap-quote-accept");
@@ -1102,7 +1120,7 @@ function mount(root: HTMLElement): void {
         arrivals = [accepted];
         showTracking(`${asset.token_symbol} to Lightning swap`);
         await mountErc20Execution(panel, {
-          prepared: accepted.prepared, asset, rpc, wallet, account, ageRecipient: info.recipient, signal: cancellation.signal,
+          prepared: accepted.prepared, asset, rpc, wallet, account, ageRecipient: info.recipient, signal: cancellation.signal, observation, network: name,
           status: (message, step, state) => setStatus(message, step, state), report, onActivity,
           download: (root, file, fileName) => { offerDownload(root, file, fileName); publishLink(file, name); },
         });
@@ -1174,7 +1192,9 @@ function mount(root: HTMLElement): void {
             node("p", `Pay over Lightning to receive ${tokenLabel(payoutTokenBase, asset)} on ${asset.name}. ` +
               `${signedFeeText("Provider", BigInt(offer.economics.success_fee_sat), (value) => `${value} sat`)}. Your EVM wallet pays claim gas.`),
             node("small", `Claim after ${offer.funding_confirmations} EVM block confirmation${offer.funding_confirmations === 1 ? "" : "s"} of the provider's lock. ` +
-              `Claim window: ${offer.timelock_delay_blocks} EVM blocks. Lightning hold budget: ${offer.incoming_htlc_expiry_delta_blocks} Bitcoin blocks.`));
+              `Estimate expires ${expiryDatetime(offer.expires_at)}.`),
+            reverseRecoveryDetails({ profile: "ln-to-erc20/v1", network: name, blockSeconds: asset.block_seconds,
+              refundDelayBlocks: offer.timelock_delay_blocks, incomingHtlcExpiryDeltaBlocks: offer.incoming_htlc_expiry_delta_blocks }));
         };
         show(); review.append(summary, priceClaim);
         const choices = node("details"); choices.append(node("summary", "Provider details & manual selection"));
@@ -1183,7 +1203,10 @@ function mount(root: HTMLElement): void {
           const label = node("label"), radio = node("input"); radio.type = "radio"; radio.name = "verified-provider"; radio.checked = index === 0;
           radio.onchange = () => { selected = quote; show(); };
           label.append(radio, node("span", `${quote.prepared.quote.offer.economics.hold_invoice_sat} sat · ${quote.prepared.quote.providerIdentity.slice(0, 12)}`),
-            ...tags(quote), node("small", `Identity: ${quote.prepared.quote.providerIdentity}; transport: ${quote.relayUrl}`)); choices.append(label);
+            ...tags(quote), reverseRecoveryDetails({ profile: "ln-to-erc20/v1", network: name, blockSeconds: asset.block_seconds,
+              refundDelayBlocks: quote.prepared.quote.offer.timelock_delay_blocks,
+              incomingHtlcExpiryDeltaBlocks: quote.prepared.quote.offer.incoming_htlc_expiry_delta_blocks }),
+            node("small", `Identity: ${quote.prepared.quote.providerIdentity}; transport: ${quote.relayUrl}`)); choices.append(label);
         }
         const accept = node("button", "Swap with this quote", "swap-quote-accept"); accept.type = "button";
         accept.className = "primary";
@@ -1211,13 +1234,15 @@ function mount(root: HTMLElement): void {
         const recoveryWallet = await walletPromise, info = await recoveryWallet.info(); current();
         const journal = new EvmClaimJournal();
         const btcTip = await readChainTip(api, { name, genesis_hash: NETWORKS[name].genesis_hash as string }, { signal: cancellation.signal }); current();
+        const evmObservedAt = Date.now(), evmTip = await rpc.blockNumber(); current();
         const prepared = await chosen.prepared.prepareExecution({
           clientEvmAddress: claimer.kind === "wallet" ? claimer.account : stagingAddress(claimer.secret),
           ...(claimer.kind === "sponsored" ? { claimKey: claimer.secret, claimDestination: claimer.destination } : {}),
-          btcTip: btcTip.height, evmTip: await rpc.blockNumber(), ageRecipient: info.recipient, saveSecrets: (file, sessionId) => journal.create(`secrets:${sessionId}`, file) });
+          btcTip: btcTip.height, evmTip, ageRecipient: info.recipient, saveSecrets: (file, sessionId) => journal.create(`secrets:${sessionId}`, file) });
         if ((await recoveryWallet.info()).fingerprint !== info.fingerprint) { prepared.dispose(); throw new Error("Recovery identity changed; request fresh terms"); }
         showTracking(`Lightning to ${asset.token_symbol} swap`);
         await mountLnErc20Execution(panel, { prepared, rpc, claimer, journal, status: setStatus, report, onActivity, signal: cancellation.signal,
+          observation: { height: evmTip, observedAt: evmObservedAt }, network: name,
           download: (root, file, fileName) => { offerDownload(root, file, fileName); publishLink(file, name); } });
       } catch (error) {
         if (!cancellation.signal.aborted) { panel.append(node("p", (error as Error).message, "swap-error"), edit); report(`stopped: ${(error as Error).message}`); }
@@ -1324,9 +1349,9 @@ function mount(root: HTMLElement): void {
             node("p", `You pay this over Lightning (plus your wallet's routing fee) and receive ${q.payoutSat.toLocaleString()} sat on-chain.`),
             node("p", `Swap cost: ${(q.holdInvoiceSat - q.payoutSat).toLocaleString()} sat. ${makerCostText(q.successFeeSat, q.feeBreakdown)} Claim mining fee: ${q.claimFeeReserveSat.toLocaleString()} sat (included in the total).`),
             time, timeDetails(timing.detail),
-            node("small", `${fundingWaitText("ln-to-btc/v1", q.fundingConfirmations)} ` +
-              `If the swap fails, your Lightning payment may stay pending for up to about ${q.incomingHtlcExpiryDeltaBlocks} blocks. ` +
-              `Estimate expires ${new Date(q.expiresAt * 1000).toLocaleTimeString()}.`));
+            node("small", `${fundingWaitText("ln-to-btc/v1", q.fundingConfirmations)} Estimate expires ${expiryDatetime(q.expiresAt)}.`),
+            reverseRecoveryDetails({ profile: "ln-to-btc/v1", network: name, refundDelayBlocks: q.refundDelayBlocks,
+              incomingHtlcExpiryDeltaBlocks: q.incomingHtlcExpiryDeltaBlocks }));
         };
         showQuote();
         review.append(node("p", "Estimated price", "swap-quote-kind"), summary, priceClaim,
@@ -1351,7 +1376,9 @@ function mount(root: HTMLElement): void {
           const time = node("small", timing.text); time.className = "swap-time-estimate"; time.title = timing.tooltip;
           label.append(option, node("span", `${q.holdInvoiceSat} sat · ${q.providerIdentity.slice(0, 12)}…`), ...tags(located),
             node("small", `Swap cost: ${(q.holdInvoiceSat - q.payoutSat).toLocaleString()} sat. ${makerCostText(q.successFeeSat, q.feeBreakdown)} Claim mining fee: ${q.claimFeeReserveSat.toLocaleString()} sat.`),
-            time, node("small", timing.detail.split(". ")[0]!));
+            time, node("small", timing.detail.split(". ")[0]!),
+            reverseRecoveryDetails({ profile: "ln-to-btc/v1", network: name, refundDelayBlocks: q.refundDelayBlocks,
+              incomingHtlcExpiryDeltaBlocks: q.incomingHtlcExpiryDeltaBlocks }));
           providers.append(label);
         }
         const wallet = await walletPromise; assertCurrent(); const info = await wallet.info(); assertCurrent();
@@ -1486,6 +1513,7 @@ function mount(root: HTMLElement): void {
     const cancellation = new AbortController();
     let executing = false;
     let arrivals: readonly LocatedQuote[] = [];
+    let recoveryObservation: ChainObservation | undefined;
     let cancelReview: (() => void) | undefined;
     const cancel = node("button", "Edit swap", "swap-edit");
     cancel.type = "button";
@@ -1527,7 +1555,9 @@ function mount(root: HTMLElement): void {
         if (cancelled) return;
         if (automaticTip) {
           setStatus("Fetching block height from your configured API", 0);
+          const observedAt = Date.now();
           const observed = await readChainTip(api, { name, genesis_hash: request.network.genesis_hash as string }, { signal: cancellation.signal });
+          recoveryObservation = { height: observed.height, observedAt };
           request = { ...request, tipHeight: observed.height };
           report(`Trusted chain API observed block ${observed.height} (${observed.hash})`);
         }
@@ -1565,7 +1595,9 @@ function mount(root: HTMLElement): void {
             node("p", `You receive ${BigInt(binding.amount_msat) / 1000n} sat over Lightning. ${makerCostText(quote.successFeeSat, quote.feeBreakdown)} Your wallet's deposit mining fee is extra.`),
             time, timeDetails(timing.detail),
             node("small", fundingWaitText("btc-to-ln/v1", quote.fundingConfirmations) + providerFeeDetails(quote.feeBreakdown)),
-            node("small", `Refund after block ${quote.refundLockHeight}. Offer expires ${new Date(quote.expiresAt * 1000).toLocaleTimeString()}.`));
+            node("small", recoveryTiming({ profile: "btc-to-ln/v1", network: name, refundLockHeight: quote.refundLockHeight,
+              observation: recoveryObservation }), "swap-quote-recovery-time"),
+            node("small", `Offer acceptance expires ${expiryDatetime(quote.expiresAt)}.`));
         };
         showQuote();
         review.append(quoteSummary, priceClaim, node("small", "Signatures authenticate offers, not provider reputation."));
@@ -1591,6 +1623,8 @@ function mount(root: HTMLElement): void {
           label.append(option, node("span", `${quote.prepared.quote.contractAmountSat} sat · ${quote.prepared.quote.providerIdentity.slice(0, 12)}…`),
             ...tags(quote), node("small", makerCostText(quote.prepared.quote.successFeeSat, quote.prepared.quote.feeBreakdown)),
             time, node("small", timing.detail.split(". ")[0]!),
+            node("small", recoveryTiming({ profile: "btc-to-ln/v1", network: name, refundLockHeight: quote.prepared.quote.refundLockHeight,
+              observation: recoveryObservation })),
             node("small", `Transport: ${quote.relayUrl}; identity: ${quote.prepared.quote.providerIdentity}`));
           offers.append(label);
         }
@@ -1626,7 +1660,7 @@ function mount(root: HTMLElement): void {
           () => validateMempoolApi(chainApi.value.trim(), name), async (file) => {
             await (await walletPromise).saveFundedRecovery(name, file);
             await refreshSavedRecoveries();
-          }, timingFor(accepted.prepared.quote));
+          }, timingFor(accepted.prepared.quote), recoveryObservation);
         if (paid) setStatus("Lightning invoice paid", 4, "success");
       } catch (error) {
         if (!cancelled) {
@@ -1693,7 +1727,7 @@ function offerDownload(panel: HTMLElement, file: Uint8Array, name: string): void
 const DEPOSIT_POLL_MS = 10_000;
 
 function fundingPrompt(panel: HTMLElement, networkName: NetworkName, request: FundingRequest, chainApi: () => string,
-  addressShown: () => void): Promise<FundingSource> {
+  addressShown: () => void, observation?: ChainObservation): Promise<FundingSource> {
   const address = scriptAddress(request.contractScript, networkName);
   const uri = `bitcoin:${address}?amount=${btc(request.amountSat)}`;
   const open = node("a", "Open in your wallet", "swap-funding-uri"); open.href = uri;
@@ -1714,7 +1748,7 @@ function fundingPrompt(panel: HTMLElement, networkName: NetworkName, request: Fu
       `${request.maxFundingFeeSat.toLocaleString()} sat. Keep this page open until it ${zeroConf ? "sees the payment" : "confirms"}; the swap then continues by itself.`, "swap-funding-rules"),
     ...(zeroConf ? [node("p", "This provider pays before your payment confirms. Do not bump its fee or replace it in your wallet: " +
       `a replaced payment is not the one bound to the swap, and you could only refund it after block ${request.refundLockHeight}.`, "swap-zero-conf-warning")] : []),
-    node("p", `If the provider does not pay, you can refund after block ${request.refundLockHeight}.`),
+    node("p", recoveryTiming({ profile: "btc-to-ln/v1", network: networkName, refundLockHeight: request.refundLockHeight, observation }), "swap-funding-recovery-time"),
     node("p", "Pay only once: a second payment to this address is not swapped and may be lost.", "swap-second-deposit-warning"),
     status,
   );
@@ -1767,6 +1801,7 @@ async function run(
   chainApi: () => string,
   persistFunded: (file: Uint8Array) => Promise<void>,
   timing: QuoteTiming,
+  recoveryObservation?: ChainObservation,
 ): Promise<boolean> {
   let fundsMayBeCommitted = false;
   // The backup stays below the stage while its prompts change, hidden until the first recovery file exists.
@@ -1796,7 +1831,7 @@ async function run(
       },
       // Showing the address can commit funds: anything sent there is the user's deposit from that moment.
       fundingSource: (funding) => {
-        const source = fundingPrompt(panel, networkName, funding, chainApi, () => { fundsMayBeCommitted = true; });
+        const source = fundingPrompt(panel, networkName, funding, chainApi, () => { fundsMayBeCommitted = true; }, recoveryObservation);
         panel.querySelector("h2")!.after(initialWait);
         return source;
       },

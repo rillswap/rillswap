@@ -274,6 +274,61 @@ reads, preserving the existing offline/manual setup behavior.
 These estimates do not change pricing, automatic selection, confirmation risk,
 existing recovery records, or fee safety checks.
 
+### Recovery timing
+
+The swap form's **Recovery timing & defaults** explains both parties' roles.
+These are reference-provider defaults, not protocol requirements or the settings
+of a discovered provider:
+
+| Direction | Claimant | Refund party and default eligibility |
+| --- | --- | --- |
+| Bitcoin to Lightning | Provider, after paying Lightning | Client, 288 Bitcoin blocks from quote-time height (about 2,880 minutes / 48 hours) |
+| Lightning to Bitcoin | Client, after funding verification | Provider, 144 Bitcoin blocks from quote-time height (about 1,440 minutes / 24 hours) |
+| ERC20 to Lightning | Provider, after paying Lightning | Client, explicitly configured EVM delay; no universal default |
+| Lightning to ERC20 | Client, after funding verification | Provider, explicitly configured EVM delay; no universal default |
+
+Providers can override `quote.max_refund_delay_blocks`,
+`quote.reverse_refund_delay_blocks`, and related safety settings. Each deployment
+serves one profile. EVM operators explicitly set `evm.forward_timelock_delay_blocks`,
+`evm.reverse_timelock_delay_blocks`, `evm.block_seconds`, and their safety margins.
+Your maximum refund delay or minimum claim window is a client acceptance limit,
+not the provider's configured value. The final signed heights govern each swap.
+
+The forward Lightning expiry budget defaults to 144 Bitcoin blocks, with a
+72-block learn-and-claim margin. The reverse minimum incoming expiry delta is
+185 blocks (144 refund + 40 resolution + 1), about 1,850 minutes / 30 hours
+50 minutes. This is not an exact or maximum wallet release time. The hold
+invoice's default one-hour payment expiry, indicative quote's 60-second expiry,
+and firm terms' 120-second acceptance expiry are separate from recovery timing.
+
+Quote comparison, funding/payment, and recovery screens show authoritative
+refund boundaries. Bitcoin refunds first mine in block `refund_lock_height + 1`;
+ERC20 refunds become eligible at the timelock block itself. First private claim
+disclosure must stop earlier: the UI shows the cutoff used by the existing
+confirmation/safety checks. Claims do not expire automatically at refund
+eligibility, but can race a competing refund. A displayed height is not proof
+that funding exists or remains unspent, nor permission to claim or refund.
+
+Where an existing fresh chain read is available (at most three minutes old when
+rendered), the UI adds remaining blocks, approximate minutes/hours, and an
+estimated local datetime including its time zone. Bitcoin recovery estimates use
+the 10-minute average; EVM estimates use the signed seconds per block. They are
+snapshots at the observed tip, not live countdowns or guaranteed expiry times.
+Regtest shows blocks only because mining is on demand. Missing, stale, or manual
+height data shows no datetime. Imported historical files remain inspectable
+offline; estimates appear only after an explicit chain check, never from record
+creation/update timestamps.
+
+Non-default badges compare explicit reverse-quote deltas with the reference
+defaults above. EVM refund delays are labeled **Provider-set timeout**. Provider
+announcements contain no recovery deltas, and the current Bitcoin-to-Lightning
+firm quote exposes only an absolute height, so neither is classified as default
+or non-default. This display adds no provider sessions or network reads, changes
+no ranking or safety rules, and requires no changes to existing saved recovery
+files or browser storage.
+
+### Swap flows
+
 **Bitcoin to Lightning.** Paste the Lightning invoice to be paid. After
 accepting the quote, send the exact amount to
 the displayed contract address from any native segwit wallet (a `bitcoin:`

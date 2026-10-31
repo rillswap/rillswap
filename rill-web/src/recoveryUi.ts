@@ -12,6 +12,7 @@ import { scriptAddress } from "./swap/address";
 import { prepareBrowserRefund, exportBrowserRefund, broadcastBrowserRefund } from "./browserRefund";
 import type { RefundJournalRecord } from "./browserRefundJournal";
 import { parseWalletBackup, recoveryKeyFromWords, walletRecoveryKey } from "./browserRecoveryWallet";
+import { recoveryTiming } from "./recoveryTiming";
 
 interface RecoveryUiOptions {
   /** Chosen by the user outside the file, including the complete chain identity. */
@@ -146,6 +147,7 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
     result.replaceChildren(element("h3", "Recovery record verified"),
       element("p", `${report.networkName} · BTC to Lightning · ${report.recordedBindingCount} recorded funding revision${report.recordedBindingCount === 1 ? "" : "s"}.`),
       element("p", `The signed refund lock is block ${report.refundLockHeight}. The first eligible block is ${report.firstRefundEligibleHeight}.`),
+      element("p", recoveryTiming({ profile: "btc-to-ln/v1", network: report.networkName, refundLockHeight: report.refundLockHeight }), "swap-recovery-time"),
       element("p", "This verifies consistency with the file's embedded signers, not its provenance or your ownership of the refund address. " +
         "Funding, unspent state, and refund maturity have not been checked."),
       element("p", "Local inspection did not connect, sign, or broadcast. Refund signing requires separate approval below."));
@@ -230,6 +232,7 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
       try {
         const identity = await readIdentity(selectedKey, selectedWords);
         plaintext = await decryptRecoveryContainer(new Uint8Array(await selectedFile.arrayBuffer()), identity);
+        const observedAt = Date.now();
         const observation = await observeRecoveryFunding(plaintext, expectedNetwork as { name: NetworkName; genesis_hash: string },
           { fundingAttemptId: binding.funding_attempt_id, bindingRevision: binding.binding_revision }, api);
         if (pendingInvalidated || options.selectedNetwork().name !== selected.name || options.selectedChainApi() !== api || revision.value !== selectedRevision ||
@@ -238,6 +241,8 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
           element("p", `${observation.confirmations} confirmation${observation.confirmations === 1 ? "" : "s"} · observed tip ${observation.tipHeight}.`),
           element("p", observation.refundMatureAtObservedTip ? "The refund lock has passed at this observed tip." :
             `Waiting for a tip above block ${observation.refundLockHeight}. The refund lock has not passed yet.`),
+          element("p", recoveryTiming({ profile: "btc-to-ln/v1", network: observation.networkName, refundLockHeight: observation.refundLockHeight,
+            observation: { height: observation.tipHeight, observedAt } }), "swap-recovery-observed-time"),
           element("p", "Repeated API responses agree on confirmed, unspent funding. These are trusted observations, not independent chain proof or permission to sign."),
           element("p", "Nothing was signed or broadcast by this funding check. Refund signing requires separate approval."));
       } catch (error) {

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import canonicalize from "canonicalize";
 import { evmRecoveryDocument, lockOf, parseEvmRecovery } from "../src/swap/erc20Swap";
-import { assertFreshEvmClaim, assertSafeEvmClaim, checkLnErc20QuoteOffer, checkLnErc20TermsOffer, payoutSatEquivalent, type LnErc20FirmRequest } from "../src/swap/lnErc20Swap";
+import { assertFreshEvmClaim, assertSafeEvmClaim, checkLnErc20QuoteOffer, checkLnErc20TermsOffer, evmClaimMarginBlocks, payoutSatEquivalent, type LnErc20FirmRequest } from "../src/swap/lnErc20Swap";
 import { EvmRpc, isErc20SwapCode } from "../src/swap/evmHtlc";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { stagingAddress } from "../src/swap/gasSponsor";
@@ -101,6 +101,17 @@ function safeRpc(change: Record<string, unknown> = {}): EvmRpc {
     findLockups: async () => [{ lock: lockOf(TERMS), txHash: "01".repeat(32), blockNumber: 1200, logIndex: 0 }],
     lockActive: async () => true, nativeBalance: async () => 1_000_000n, gasPrice: async () => 1n, ...change } as unknown as EvmRpc;
 }
+test("the advisory margin shares the exact first-disclosure boundary, including the final live check", async () => {
+  const margin = evmClaimMarginBlocks(TERMS);
+  expect(margin).toBe(Math.max(TERMS.settlement_confirmations + 12, Math.ceil(600 / TERMS.evm_asset.block_seconds)));
+  const cutoff = TERMS.htlc_timelock_block - margin;
+  await assertSafeEvmClaim(safeRpc({ blockNumber: async () => cutoff - 1 }), TERMS, PREIMAGE);
+  await expect(assertSafeEvmClaim(safeRpc({ blockNumber: async () => cutoff }), TERMS, PREIMAGE)).rejects.toThrow("Too close");
+  let samples = 0;
+  await expect(assertSafeEvmClaim(safeRpc({ blockNumber: async () => ++samples === 1 ? cutoff - 1 : cutoff }), TERMS, PREIMAGE))
+    .rejects.toThrow("Claim window or active lock changed");
+});
+
 test("claim safety guards refuse wrong chain, contract, lock, depth, active state, margin and gas", async () => {
   await assertSafeEvmClaim(safeRpc(), TERMS, PREIMAGE);
   for (const rpc of [safeRpc({ chainId: async () => 1 }), safeRpc({ verifyHtlc: async () => { throw new Error("wrong code"); } }),

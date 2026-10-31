@@ -198,7 +198,8 @@ test("Lightning to Bitcoin keeps estimates private and retains sessions only unt
   await expect(page.locator("#swap-quote-review")).toContainText("receive 50,000 sat on-chain");
   await expect(page.locator("#swap-quote-review")).toContainText("Estimated price");
   await expect(page.locator("#swap-quote-review")).toContainText("Claim after 2 confirmations of funding, then wait for the claim to confirm");
-  await expect(page.locator("#swap-quote-review")).toContainText("pending for up to about 288 blocks");
+  await expect(page.locator("#swap-quote-review")).toContainText("Lightning hold expiry budget: at least 288 Bitcoin blocks");
+  await expect(page.locator("#swap-quote-review")).toContainText("Actual wallet release can differ");
   await expect(page.locator("#swap-reverse-pending")).toContainText("no address or payment hash was shared");
   await expect(page.locator("#swap-quote-accept")).toHaveCount(0);
   expect(tips).toEqual([]); // estimates need no chain height

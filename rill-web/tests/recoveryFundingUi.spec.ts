@@ -192,6 +192,7 @@ test("local inspection connects to nothing; an explicit funding check reports tr
   await expect(page.locator("#swap-recovery-funding-result h3")).toHaveText("Funding observed by your API");
   await expect(page.locator("#swap-recovery-funding-result")).toContainText("102 confirmations");
   await expect(page.locator("#swap-recovery-funding-result")).toContainText("refund lock has passed");
+  await expect(page.locator("#swap-recovery-observed-time")).toContainText("Observed tip 1101 has reached this height");
   await expect(page.locator("#swap-recovery-funding-result")).toContainText("not independent chain proof or permission to sign");
   await expect(page.locator("#swap-recovery-funding-result")).toContainText("Nothing was signed or broadcast");
   expect(calls.filter((path) => path.endsWith("/hex"))).toHaveLength(2);
@@ -209,6 +210,9 @@ test("a coherent immature observation is a waiting state, not a refund authoriza
   await expect(page.locator("#swap-recovery-funding-result h3")).toHaveText("Funding observed by your API");
   await expect(page.locator("#swap-recovery-funding-result")).toContainText("Waiting for a tip above block 1100");
   await expect(page.locator("#swap-recovery-funding-result")).not.toContainText("refund lock has passed");
+  await expect(page.locator("#swap-recovery-observed-time")).toContainText("1 block remaining at observed tip 1100");
+  await expect(page.locator("#swap-recovery-observed-time")).toContainText("mining is on demand");
+  await expect(page.locator("#swap-recovery-observed-time")).not.toContainText("estimated ");
 });
 
 test("preparing is the destination approval, export records exposure, and identical saved bytes remain recoverable", async ({ page }, testInfo) => {

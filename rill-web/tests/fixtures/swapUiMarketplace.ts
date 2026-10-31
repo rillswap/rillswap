@@ -113,7 +113,8 @@ export const quoteReverseProviders = async (_providers: unknown[], request: unkn
         return {
           terms: { economics: { hold_invoice_sat: String(51_000 + Number(id)), nominal_payout_sat: "50000", success_fee_sat: "500", claim_fee_reserve_sat: "500" },
             funding_confirmations: 2, refund_lock_height: 400, max_claim_fee_sat: "800", client_destination_script: "0014" + "11".repeat(20),
-            invoice_binding: { expires_at: expiresAt } },
+            invoice_binding: { expires_at: expiresAt }, terms_expiry: expiresAt - 120,
+            timing_policy: { claim_confirmation_blocks: 6 } },
           recoveryFile: new Uint8Array([8, 8, 8]), record,
           get claimDepth() { return claimDepth; },
           lowerClaimDepth: (depth: number) => {

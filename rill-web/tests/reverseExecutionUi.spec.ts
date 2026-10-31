@@ -52,6 +52,25 @@ test("without a Settings choice there is no warning and the claim depth is the s
   await mountedExecution(page);
   expect(await page.evaluate(() => window.uiFixture.reverseClaimConfirmations)).toEqual([null]);
   await expect(page.locator("#swap-reverse-early-claim")).toHaveCount(0);
+  await expect(page.locator("#swap-reverse-recovery-time")).toContainText("Provider refund becomes eligible from Bitcoin block 401");
+  await expect(page.locator("#swap-reverse-recovery-time")).toContainText("First claim disclosure requires a tip below Bitcoin block");
+  await expect(page.locator("#swap-reverse-recovery-time")).toContainText("mining is on demand");
+  await expect(page.locator("#swap-reverse-steps")).toContainText("Offer acceptance expires");
+  await expect(page.locator("#swap-reverse-steps")).toContainText("Invoice payment expires");
+});
+
+test("quote comparisons label explicit non-default Lightning deltas without extra execution or payment", async ({ page }) => {
+  await page.goto(PAGE);
+  await page.getByRole("button", { name: "Switch direction" }).click();
+  await page.locator("#swap-receive-amount").fill("50000");
+  await page.locator("#swap-compare").click();
+  await expect(page.locator("#swap-quote-summary")).toContainText("Provider refund delay: 144 Bitcoin blocks");
+  await expect(page.locator("#swap-quote-summary")).toContainText("Lightning hold expiry budget: at least 288 Bitcoin blocks");
+  await expect(page.locator("#swap-quote-review .swap-offer-tag.timeout")).toHaveText(["Non-default Lightning delta", "Non-default Lightning delta", "Non-default Lightning delta"]);
+  await expect(page.locator("#swap-quote-review .swap-offer-tag.timeout").filter({ hasText: "Non-default refund delay" })).toHaveCount(0);
+  expect(await page.evaluate(() => window.uiFixture.requests)).toHaveLength(1);
+  expect(await page.evaluate(() => window.uiFixture.reverseEvents ?? [])).toEqual([]);
+  expect(await page.evaluate(() => window.uiFixture.reverseClaimConfirmations)).toBeUndefined();
 });
 
 test("a malformed claim depth blocks continuation before any execution is prepared", async ({ page }) => {

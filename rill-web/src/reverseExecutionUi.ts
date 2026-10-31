@@ -14,6 +14,7 @@ import { RecoveryFundingUnavailableError } from "./recoveryFunding";
 import type { PreparedReverseQuote } from "./swap/reverseSwap";
 import type { PreparedReverseExecution } from "./swap/reverseExecution";
 import { makerCostText, miningAllowanceDetails } from "./swapUiStatus";
+import { expiryDatetime, recoveryTiming } from "./recoveryTiming";
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", id = ""): HTMLElementTagNameMap[K] {
   const element = document.createElement(tag); element.textContent = text; if (id) element.id = id; return element;
@@ -67,6 +68,8 @@ export function earlyClaimWarning(depth: number, signed: number): string | null 
 function view(root: HTMLElement, e: ClaimExecution, options: ReverseProgressOptions) {
   const screen = node("section", "", "swap-reverse-steps"), advanced = node("details", "", "swap-reverse-advanced");
   const message = node("p", "", "swap-reverse-message"), backups = node("div", "", "swap-reverse-backups");
+  const recovery = node("p", recoveryTiming({ profile: "ln-to-btc/v1", network: options.network.name,
+    refundLockHeight: e.terms.refund_lock_height, claimMarginBlocks: e.terms.timing_policy.claim_confirmation_blocks }), "swap-reverse-recovery-time");
   // The shown invoice stays reachable after funding, while the wallet may still report it as pending or failed.
   const payment = node("section", "", "swap-reverse-payment"); payment.hidden = true;
   advanced.append(node("summary", "Advanced"));
@@ -82,8 +85,8 @@ function view(root: HTMLElement, e: ClaimExecution, options: ReverseProgressOpti
     const link = backups.querySelector("a"); if (link) link.textContent = "Download swap backup";
     options.saved?.(file);
   };
-  root.replaceChildren(screen, payment, advanced, message);
-  return { screen, payment, advanced, message, fee, backup };
+  root.replaceChildren(screen, payment, recovery, advanced, message);
+  return { screen, payment, recovery, advanced, message, fee, backup };
 }
 
 /** The invoice shown for an external wallet, with its payment hash. */
@@ -105,7 +108,7 @@ function paymentDetails(e: ClaimExecution, open: boolean): { notes: HTMLParagrap
 function paymentNotes(e: ClaimExecution, claimNowOffered: boolean): string {
   const stage = e.record.stage;
   if (stage === "payment-unknown") {
-    const expires = new Date(e.terms.invoice_binding.expires_at * 1000).toLocaleString();
+    const expires = expiryDatetime(e.terms.invoice_binding.expires_at);
     return `If your wallet has not sent this payment, pay it once before ${expires}. If it did, do not pay again: the provider locks the Bitcoin once it holds your payment.`;
   }
   if (stage === "claim-unknown" || stage === "accepted") return "Your claim lets the provider settle this payment. Do not pay again.";
@@ -273,7 +276,7 @@ export async function mountReverseExecution(root: HTMLElement, options: ReverseE
   window.addEventListener("pagehide", stopped, { once: true });
   try {
     current(); options.status("Checking signed final terms", 0);
-    const api = validateMempoolApi(options.chainApi, options.network.name), tip = await readChainTip(api, options.network); current();
+    const observedAt = Date.now(), api = validateMempoolApi(options.chainApi, options.network.name), tip = await readChainTip(api, options.network); current();
     // No estimate, no swap: the claim reserve must pay at least the next-block rate.
     const claimFeeRateSatKvb = await readNextBlockFeeRate(api, options.network.name, { signal: cancellation.signal }); current();
     execution = await options.prepared.prepareExecution({ destinationScript: options.destinationScript, tipHeight: tip.height, claimFeeRateSatKvb,
@@ -281,9 +284,12 @@ export async function mountReverseExecution(root: HTMLElement, options: ReverseE
       ...(options.claimConfirmations !== undefined ? { claimConfirmations: options.claimConfirmations } : {}),
       ...(options.report ? { report: options.report } : {}) }); current();
     const e = execution, terms = e.terms, v = view(root, e, options); v.backup(e.recoveryFile);
+    v.recovery.textContent = recoveryTiming({ profile: "ln-to-btc/v1", network: options.network.name, refundLockHeight: terms.refund_lock_height,
+      claimMarginBlocks: terms.timing_policy.claim_confirmation_blocks, observation: { height: tip.height, observedAt } });
     v.screen.append(node("h2", `Pay ${BigInt(terms.economics.hold_invoice_sat).toLocaleString()} sat`),
       node("p", `Receive at least ${BigInt(terms.economics.nominal_payout_sat).toLocaleString()} sat in Bitcoin. Your wallet's routing fee is extra.`),
-      node("p", "After payment, this page checks confirmations and claims your Bitcoin automatically."));
+      node("p", "After payment, this page checks confirmations and claims your Bitcoin automatically."),
+      node("small", `Offer acceptance expires ${expiryDatetime(terms.terms_expiry)}. Invoice payment expires ${expiryDatetime(terms.invoice_binding.expires_at)}. These are not recovery deadlines.`));
     const fees = e.feeBreakdown;
     const timing = quoteTiming({ profile: "ln-to-btc/v1", fundingConfirmations: e.claimDepth,
       ...(fees ? { fundingRate: Number(fees.feerate_sat_kvb) / 1000 } : {}),
@@ -292,7 +298,7 @@ export async function mountReverseExecution(root: HTMLElement, options: ReverseE
     v.screen.append(node("p", `${makerCostText(BigInt(terms.economics.success_fee_sat), fees)} Claim mining fee: ${BigInt(terms.economics.claim_fee_reserve_sat).toLocaleString()} sat (included in the Lightning total).`),
       time);
     v.advanced.append(node("small", timing.detail));
-    if (fees) v.advanced.append(node("small", `${miningAllowanceDetails(fees)} Accept before ${new Date(terms.terms_expiry * 1000).toLocaleTimeString()}.`));
+    if (fees) v.advanced.append(node("small", miningAllowanceDetails(fees)));
     // Before any payment: the client's own lower claim depth risks a provider double-spend.
     const warning = earlyClaimWarning(e.claimDepth, terms.funding_confirmations);
     if (warning !== null) { v.screen.append(node("p", warning, "swap-reverse-early-claim")); options.report?.(`warning: ${warning}`); }
@@ -312,7 +318,8 @@ export async function mountReverseExecution(root: HTMLElement, options: ReverseE
         v.screen.replaceChildren(node("h2", `Pay ${terms.economics.hold_invoice_sat} sat`),
           qrSvg(`lightning:${invoice.bolt11}`, "QR code of the Lightning invoice", "swap-reverse-invoice-qr"),
           node("pre", invoice.bolt11, "swap-reverse-invoice"), open,
-          node("p", "Pay it once; your wallet shows it as pending until Bitcoin is locked and claimed, because only your browser holds the secret needed to settle it.", "swap-reverse-invoice-notes"));
+          node("p", "Pay it once; your wallet shows it as pending until Bitcoin is locked and claimed, because only your browser holds the secret needed to settle it.", "swap-reverse-invoice-notes"),
+          node("small", `Invoice payment expires ${expiryDatetime(terms.invoice_binding.expires_at)}. This is not the held payment's release time.`));
         const copy = button(v.screen, "Copy invoice", "swap-reverse-invoice-copy");
         copy.onclick = () => { void navigator.clipboard?.writeText(invoice.bolt11).then(() => { copy.textContent = "Copied"; }, () => {}); };
         afterPayment();

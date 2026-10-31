@@ -87,6 +87,8 @@ test("the recovery panel uses the saved browser key and makes no external connec
   await expect(page.locator("#swap-recovery-result h3")).toHaveText("Recovery record verified");
   await expect(page.locator("#swap-recovery-result")).toContainText("regtest · BTC to Lightning · 1 recorded funding revision.");
   await expect(page.locator("#swap-recovery-result")).toContainText("first eligible block is 1101");
+  await expect(page.locator("#swap-recovery-time")).toContainText("Your refund becomes eligible from Bitcoin block 1101");
+  await expect(page.locator("#swap-recovery-time")).toContainText("Time estimate unavailable without a fresh chain observation");
   await expect(page.locator("#swap-recovery-result")).toContainText("Local inspection did not connect, sign, or broadcast");
   expect(sockets).toEqual([]);
   for (const url of requests) expect(new URL(url).host).toBe("127.0.0.1:18765");

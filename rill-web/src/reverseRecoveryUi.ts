@@ -4,6 +4,7 @@ import { observeReverseRecoveryFunding, RecoveryFundingSpentError } from "./reco
 import { loadBrowserReverseRecovery, recoverBrowserReverseFunding, prepareRecoveredReverseClaim, exposeRecoveredReverseClaim } from "./browserReverseRecovery";
 import { scriptAddress } from "./swap/address";
 import type { NetworkName } from "./swap/config";
+import { recoveryTiming } from "./recoveryTiming";
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", id = ""): HTMLElementTagNameMap[K] { const e = document.createElement(tag); e.textContent = text; if (id) e.id = id; return e; }
 function button(root: HTMLElement, text: string, id: string): HTMLButtonElement { const e = node("button", text, id); e.type = "button"; root.append(e); return e; }
@@ -16,9 +17,11 @@ export function reverseRecoveryControls(root: HTMLElement, options: {
   const document = Uint8Array.from(options.plaintext), network = structuredClone(options.network); let disposed = false, busy = false;
   const current = (): void => { if (disposed) throw new Error("Selection changed"); options.assertCurrent(); };
   const report = inspectReverseRecoveryPlaintext(document, network), message = node("p", "", "swap-reverse-recovery-message"), controls = node("section"), files = node("section");
+  const timing = node("p", recoveryTiming({ profile: "ln-to-btc/v1", network: report.networkName,
+    refundLockHeight: report.refundLockHeight, claimMarginBlocks: report.claimConfirmationBlocks }), "swap-reverse-recovery-time");
   let confirmSaved: (saved: { claimTxid: string | null; claimFeeSat: string | null; stage: string }) => void = () => {};
   root.replaceChildren(node("h3", "Lightning to Bitcoin recovery verified"), node("p", `${report.networkName} · ${report.fundingHistory.length} signed funding revision(s). Payout: ${scriptAddress(report.destinationScript, report.networkName)}.`),
-    node("p", "This proves internal consistency under embedded signers, not provenance, ownership or current funding. Nothing connected or was paid. Recovery never accepts or pays another invoice."), controls, files, message);
+    node("p", "This proves internal consistency under embedded signers, not provenance, ownership or current funding. Nothing connected or was paid. Recovery never accepts or pays another invoice."), timing, controls, files, message);
   const act = (control: HTMLButtonElement, run: () => Promise<void>): void => { control.onclick = () => {
     if (busy || disposed) return; busy = true; control.disabled = true;
     void run().catch((error: unknown) => {
@@ -41,8 +44,11 @@ export function reverseRecoveryControls(root: HTMLElement, options: {
   if (report.fundingHistory.length) {
     const binding = report.fundingHistory.at(-1)!, selection = { fundingAttemptId: binding.funding_attempt_id, bindingRevision: binding.binding_revision };
     const check = button(controls, "Check reverse funding with selected API", "swap-reverse-recovery-check");
-    act(check, async () => { current(); const api = options.chainApi(), observation = await observeReverseRecoveryFunding(document, network, selection, api); current();
-      if (options.chainApi() !== api) throw new Error("API changed"); message.textContent = `Trusted API: ${observation.confirmations} confirmations at block ${observation.tipHeight}. Required claim margin: ${report.claimConfirmationBlocks} blocks before first provider refund block ${report.refundLockHeight + 1}. This is not independent chain proof.`; });
+    act(check, async () => { current(); const api = options.chainApi(), observedAt = Date.now(), observation = await observeReverseRecoveryFunding(document, network, selection, api); current();
+      if (options.chainApi() !== api) throw new Error("API changed");
+      timing.textContent = recoveryTiming({ profile: "ln-to-btc/v1", network: report.networkName, refundLockHeight: report.refundLockHeight,
+        claimMarginBlocks: report.claimConfirmationBlocks, observation: { height: observation.tipHeight, observedAt } });
+      message.textContent = `Trusted API: ${observation.confirmations} confirmations at block ${observation.tipHeight}. Required claim margin: ${report.claimConfirmationBlocks} blocks before first provider refund block ${report.refundLockHeight + 1}. This is not independent chain proof.`; });
     const feeLabel = node("label", "Claim network fee (sat)"), fee = node("input", "", "swap-reverse-recovery-fee"); fee.type = "number"; fee.min = "0";
     fee.value = report.fallbackFeeSat ?? String(BigInt(report.maxClaimFeeSat) < BigInt(report.claimFeeReserveSat) ? BigInt(report.maxClaimFeeSat) : BigInt(report.claimFeeReserveSat)); feeLabel.htmlFor = fee.id;
     // Each button is its own approval; the consent notes state what it approves. No checkbox gates them.

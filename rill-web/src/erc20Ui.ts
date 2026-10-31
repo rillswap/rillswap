@@ -11,12 +11,13 @@ import {
 import { GasSponsor, type SponsorConfig, stagingAddress } from "./swap/gasSponsor";
 import type { EvmSponsorDefaults } from "./swap/config";
 import type { EvmAssetIdentity } from "./manualProviderAdvertisement";
-import { assertFreshEvmClaim, assertSafeEvmClaim, type PreparedLnErc20Execution } from "./swap/lnErc20Swap";
+import { assertFreshEvmClaim, assertSafeEvmClaim, evmClaimMarginBlocks, type PreparedLnErc20Execution } from "./swap/lnErc20Swap";
 import { EvmClaimJournal } from "./evmClaimJournal";
 import { qrSvg } from "./qr";
 import canonicalize from "canonicalize";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { encryptCanonicalRecoveryForRecipient } from "./recoveryAgeContainer";
+import { expiryDatetime, recoveryTiming, type ChainObservation } from "./recoveryTiming";
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", id = ""): HTMLElementTagNameMap[K] {
   const e = document.createElement(tag); e.textContent = text; if (id) e.id = id; return e;
@@ -61,6 +62,8 @@ export async function connectEvmWallet(rpc: EvmRpc, asset: EvmAssetIdentity): Pr
 }
 
 export interface Erc20ExecutionOptions {
+  readonly network: string;
+  readonly observation?: ChainObservation;
   readonly onActivity?: ActivityObserver;
   readonly prepared: PreparedErc20Swap;
   readonly asset: EvmAssetIdentity;
@@ -88,7 +91,8 @@ export async function mountErc20Execution(panel: HTMLElement, options: Erc20Exec
   const withFundingLock = erc20FundingLock(asset, account, options.signal);
   const files = node("section", "", "swap-erc20-files");
   const message = node("p", "", "swap-erc20-message");
-  panel.replaceChildren(message, files);
+  panel.replaceChildren(message, node("p", recoveryTiming({ profile: "erc20-to-ln/v1", network: options.network,
+    refundLockHeight: prepared.quote.timelockBlock, blockSeconds: asset.block_seconds, observation: options.observation }), "swap-erc20-recovery-time"), files);
   const say = (text: string, step: number, state?: string): void => { message.textContent = text; status(text, step, state); };
   const lock = async (terms: HtlcLock, htlc: string): Promise<string> => {
     const balance = await rpc.balanceOf(terms.token, account);
@@ -179,6 +183,9 @@ export function evmRecoveryControls(root: HTMLElement, options: EvmRecoveryOptio
   if (record.terms.profile_id === "ln-to-erc20/v1") return reverseEvmRecoveryControls(root, record, options);
   const { terms, lock } = record;
   const asset = terms.evm_asset;
+  const network = (terms.network_identity as { name: string }).name;
+  const timing = node("p", recoveryTiming({ profile: "erc20-to-ln/v1", network, refundLockHeight: lock.timelock,
+    blockSeconds: asset.block_seconds }), "swap-evm-recovery-time");
   const message = node("p", "", "swap-evm-recovery-message");
   const check = node("button", "Check lock status", "swap-evm-recovery-check"); check.type = "button";
   const refund = node("button", `Refund ${tokenLabel(lock.amount, asset)} with your wallet`, "swap-evm-recovery-refund"); refund.type = "button";
@@ -191,19 +198,21 @@ export function evmRecoveryControls(root: HTMLElement, options: EvmRecoveryOptio
       (record.lockTxHash ? ` Lock transaction ${record.lockTxHash}.` : " No lock transaction recorded.") +
       (record.preimage ? " The provider paid; the preimage is known." : "")),
     node("p", "Verified locally against the provider's signature. Checking the chain and refunding connect to the configured EVM RPC and your wallet only when you ask."),
-    message, check, refund,
+    timing, message, check, refund,
   );
   const openRpc = (): EvmRpc => (options.rpcFactory ?? ((url) => new EvmRpc(url)))(options.evmRpc());
   const inspect = async (): Promise<{ active: boolean; tip: number }> => {
     const rpc = openRpc();
     if (await rpc.chainId() !== asset.chain_id) throw new Error(`The configured EVM RPC is not chain ${asset.chain_id}`);
-    const tip = await rpc.blockNumber();
+    const observedAt = Date.now(), tip = await rpc.blockNumber();
     const active = await rpc.lockActive(asset.htlc_contract, lock);
     current();
+    timing.textContent = recoveryTiming({ profile: "erc20-to-ln/v1", network, refundLockHeight: lock.timelock,
+      blockSeconds: asset.block_seconds, observation: { height: tip, observedAt } });
     if (active) {
       message.textContent = tip >= lock.timelock
         ? `Still locked at block ${tip}. The timelock (${lock.timelock}) has passed: you can refund.`
-        : `Still locked at block ${tip}. Refund possible from block ${lock.timelock} (${lock.timelock - tip} blocks, about ${Math.ceil((lock.timelock - tip) * asset.block_seconds / 60)} min).`;
+        : `Still locked at block ${tip}. Refund possible from block ${lock.timelock}.`;
     } else {
       const claim = await rpc.findClaim(asset.htlc_contract, lock.preimageHash, Math.max(0, tip - 10_000), tip).catch(() => null);
       message.textContent = claim ? `Claimed by the provider in ${claim.txHash}; the invoice was paid. Nothing to refund.`
@@ -243,6 +252,10 @@ export function evmRecoveryControls(root: HTMLElement, options: EvmRecoveryOptio
 function reverseEvmRecoveryControls(root: HTMLElement, record: EvmRecoveryRecord, options: EvmRecoveryOptions): () => void {
   const terms = record.terms;
   if (terms.profile_id !== "ln-to-erc20/v1") throw new Error("not reverse EVM recovery");
+  const network = (terms.network_identity as { name: string }).name;
+  const timingInput = { profile: "ln-to-erc20/v1" as const, network, refundLockHeight: record.lock.timelock,
+    blockSeconds: terms.evm_asset.block_seconds, claimMarginBlocks: evmClaimMarginBlocks(terms) };
+  const timing = node("p", recoveryTiming(timingInput), "swap-evm-recovery-time");
   const plaintext = Uint8Array.from(options.plaintext), journal = new EvmClaimJournal();
   let disposed = false, busy = false;
   const current = (): void => { if (disposed) throw new Error("Recovery view closed"); options.assertCurrent(); };
@@ -254,7 +267,7 @@ function reverseEvmRecoveryControls(root: HTMLElement, record: EvmRecoveryRecord
   root.replaceChildren(node("h3", `Lightning to ${terms.evm_asset.token_symbol} recovery verified`),
     node("p", `${tokenLabel(record.lock.amount, terms.evm_asset)} to ${record.lock.claimAddress}` +
       (record.claimDestination ? `, forwarded to ${record.claimDestination}` : "") + `. Provider refund block ${record.lock.timelock}. ` +
-      "Keep the preimage private until a confirmed token lock has enough time left. A failed claim request may still disclose it."), message, check, claim);
+      "Keep the preimage private until a confirmed token lock has enough time left. A failed claim request may still disclose it."), timing, message, check, claim);
   if (record.claimKey !== null && !sponsorConfig) root.append(node("p", "This record's claim key lives in this browser; configure the gas sponsor in Settings to claim without a wallet.", "swap-evm-recovery-note"));
   // Do not redisplay an old hold invoice on reload: it may have been paid already.
   const rpc = (): EvmRpc => (options.rpcFactory ?? ((url) => new EvmRpc(url)))(options.evmRpc());
@@ -264,9 +277,10 @@ function reverseEvmRecoveryControls(root: HTMLElement, record: EvmRecoveryRecord
       current(); const chain = rpc();
       if (await chain.chainId() !== terms.evm_asset.chain_id) throw new Error("Wrong EVM chain");
       await chain.verifyHtlc(terms.evm_asset.htlc_contract);
-      const tip = await chain.blockNumber();
+      const observedAt = Date.now(), tip = await chain.blockNumber();
       const found = await chain.findClaim(terms.evm_asset.htlc_contract, record.lock.preimageHash, Math.max(0, terms.evm_reference_block - 12), tip);
       current();
+      timing.textContent = recoveryTiming({ ...timingInput, observation: { height: tip, observedAt } });
       if (found) {
         message.textContent = record.claimKey !== null
           ? `Claim observed in ${found.txHash}; sponsored completion is unverified. This record does not retain the submitted operation proof. Inspect the exact payout; do not retry automatically.`
@@ -327,6 +341,7 @@ function reverseEvmRecoveryControls(root: HTMLElement, record: EvmRecoveryRecord
 }
 
 export async function mountLnErc20Execution(panel: HTMLElement, options: {
+  readonly network: string; readonly observation?: ChainObservation;
   readonly prepared: PreparedLnErc20Execution; readonly rpc: EvmRpc; readonly claimer: LnErc20Claimer;
   readonly journal: EvmClaimJournal; readonly status: (message: string, step: number, state?: string) => void;
   readonly report: (line: string) => void; readonly download: (root: HTMLElement, file: Uint8Array, name: string) => void;
@@ -335,7 +350,9 @@ export async function mountLnErc20Execution(panel: HTMLElement, options: {
 }): Promise<void> {
   const { prepared, rpc, claimer, journal } = options, asset = prepared.terms.evm_asset;
   const files = node("section", "", "swap-erc20-files"), invoice = node("section"), message = node("p", "Preparing durable recovery before exposing the invoice");
-  panel.replaceChildren(message, invoice, files);
+  panel.replaceChildren(message, node("p", recoveryTiming({ profile: "ln-to-erc20/v1", network: options.network,
+    refundLockHeight: prepared.terms.htlc_timelock_block, blockSeconds: asset.block_seconds,
+    claimMarginBlocks: evmClaimMarginBlocks(prepared.terms), observation: options.observation }), "swap-erc20-recovery-time"), invoice, files);
   let sponsored: { txHash: string; proof: SponsoredClaimProof } | null = null;
   const outcome = await prepared.execute({
     rpc, report: options.report,
@@ -347,6 +364,7 @@ export async function mountLnErc20Execution(panel: HTMLElement, options: {
     showInvoice: (bolt11) => {
       invoice.replaceChildren(node("h3", `Pay ${prepared.terms.economics.hold_invoice_sat} sat from any Lightning wallet`),
         node("p", "No Lightning node connection is needed. Your payment stays held until the token claim reveals the preimage."),
+        node("small", `Offer acceptance expires ${expiryDatetime(prepared.terms.terms_expiry)}. Invoice payment expires ${expiryDatetime(prepared.terms.invoice_binding.expires_at)}. These are not recovery deadlines.`),
         qrSvg(`lightning:${bolt11}`, "QR code of the Lightning invoice", "swap-reverse-invoice-qr"),
         node("code", bolt11, "swap-reverse-invoice"));
       const open = node("a", "Open in Lightning wallet"); open.href = `lightning:${bolt11}`; invoice.append(open);
