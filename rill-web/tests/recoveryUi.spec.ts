@@ -187,3 +187,40 @@ test("changing the independently selected network while opening a file discards 
   await expect(page.locator("#swap-recovery-result h3")).toHaveCount(0);
   await expect(page.locator("#swap-recovery-inspect")).toBeEnabled();
 });
+
+test("another origin needs the original key, not domain permission, and importing words never replaces its own wallet", async ({ page, context }) => {
+  await page.goto("http://127.0.0.1:18765/test-only/swap.html");
+  const original = await page.evaluate(async () => {
+    const wallet = await window.uiFixture.wallet.open();
+    try { return { recipient: (await wallet.recoveryKey()).recipient, mnemonic: JSON.parse(new TextDecoder().decode(await wallet.exportBackup())).mnemonic as string }; }
+    finally { wallet.close(); }
+  });
+  const encrypted = await encryptCanonicalRecoveryForRecipient(plaintext("signed funding revision zero"), original.recipient);
+  await openRecovery(page); await page.locator("#swap-recovery-file").setInputFiles(payload(encrypted, "original-swap.age"));
+  await page.locator("#swap-recovery-inspect").click();
+  await expect(page.locator("#swap-recovery-result h3")).toHaveText("Recovery record verified");
+  const other = await context.newPage(); await other.goto("http://localhost:18765/test-only/swap.html");
+  const fingerprint = await other.evaluate(async () => { const wallet = await window.uiFixture.wallet.open(); try { return (await wallet.info()).fingerprint; } finally { wallet.close(); } });
+  await openRecovery(other); await other.locator("#swap-recovery-file").setInputFiles(payload(encrypted, "original-swap.age"));
+  await other.locator("#swap-recovery-inspect").click();
+  await expect(other.locator("#swap-recovery-result")).toContainText("encrypted file could not be opened with this key");
+  await expect(other.locator("#swap-recovery-result")).toContainText("original recovery words or key backup");
+  await expect(other.locator("#swap-recovery-words")).toBeVisible();
+  await other.locator("#swap-recovery-words").fill(original.mnemonic); await other.locator("#swap-recovery-inspect").click();
+  await expect(other.locator("#swap-recovery-result h3")).toHaveText("Recovery record verified");
+  expect(await other.evaluate(async () => { const wallet = await window.uiFixture.wallet.open(); try { return (await wallet.info()).fingerprint; } finally { wallet.close(); } })).toBe(fingerprint);
+});
+
+test("a decrypted record on the wrong network reports verification rather than a missing decryption key", async ({ page }) => {
+  const key = await createRecoveryKey();
+  const file = await encryptCanonicalRecoveryForRecipient(plaintext("signed funding revision zero"), key.recipient);
+  await page.goto("http://127.0.0.1:18765/test-only/swap.html");
+  await openSettings(page, "connection"); await page.locator("#swap-network").selectOption("signet");
+  await page.locator("#swap-settings-close").click(); await openRecovery(page);
+  await page.locator("#swap-recovery-file").setInputFiles(payload(file, "regtest.age"));
+  await page.locator("#swap-recovery-key-file").setInputFiles(payload(key.file, "original.key"));
+  await page.locator("#swap-recovery-inspect").click();
+  await expect(page.locator("#swap-recovery-result")).toContainText("file decrypted");
+  await expect(page.locator("#swap-recovery-result")).toContainText("Check the original network");
+  await expect(page.locator("#swap-recovery-result")).not.toContainText("encrypted file could not be opened");
+});

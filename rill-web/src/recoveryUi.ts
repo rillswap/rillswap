@@ -55,7 +55,9 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
   const details = element("details", "", "swap-recovery");
   details.append(element("summary", "Recover a swap"), element("p",
     "Open an encrypted swap recovery file using your saved browser key. " +
-    "Choose the original swap's network in Settings. Files and keys stay on this device."));
+    "Choose the original swap's network in Settings. Files and keys stay on this device."), element("p",
+    "Recovering on another site or browser also requires the original recovery words or key backup. " +
+    "The encrypted .age file cannot be opened with the network alone. There is no domain restriction, but each site has separate browser key storage."));
   const fileLabel = element("label", "Encrypted swap recovery file (.age)");
   const file = element("input", "", "swap-recovery-file");
   file.type = "file";
@@ -63,7 +65,9 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
   fileLabel.htmlFor = file.id;
   details.append(fileLabel, file);
   const olderKey = element("details");
-  olderKey.append(element("summary", "Use a saved recovery key (optional)"), element("p", "Enter its 12 words or choose a key backup; your browser's saved key is not replaced."));
+  olderKey.append(element("summary", "Use a saved recovery key (optional)"), element("p",
+    "Enter the original site's 12 words or choose its key backup. This is required if the file uses a different key from this browser's saved key. " +
+    "One mnemonic can unlock many swap files; your browser's saved key is not replaced."));
   const wordsLabel = element("label", "12-word recovery key"), words = element("input", "", "swap-recovery-words");
   words.type = "password"; words.autocomplete = "off"; words.spellcheck = false; words.maxLength = 4096; wordsLabel.htmlFor = words.id;
   olderKey.append(wordsLabel, words);
@@ -216,8 +220,15 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
         show(report);
       } catch {
         // No parser/crypto/wallet error, raw input, path, filename, or secret becomes a UI diagnostic.
-        result.replaceChildren(element("p", "Could not verify this recovery file. Check the selected network and original recovery key. " +
-          "Keep your original backups; nothing was changed or uploaded."));
+        if (!plaintext) {
+          olderKey.open = true;
+          result.replaceChildren(element("p", "Could not verify this recovery file. The encrypted file could not be opened with this key. " +
+            "If it came from another site or browser, enter the original recovery words or key backup under Use a saved recovery key. " +
+            "This site cannot read another site's browser-stored key. Keep your original backups; nothing was changed or uploaded."));
+        } else {
+          result.replaceChildren(element("p", "Could not verify this recovery file. The file decrypted, but its record could not be verified for the current selection. " +
+            "Check the original network and keep your original backups; nothing was changed or uploaded."));
+        }
       } finally {
         // Best-effort byte clearing, not a guarantee for immutable strings or decrypter copies.
         plaintext?.fill(0);
