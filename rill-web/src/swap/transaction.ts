@@ -178,10 +178,19 @@ function readOutputs(reader: Reader): TxOutput[] {
 
 /** Parse one complete version-2 transaction; witness data is optional. */
 export function parseTransaction(raw: Uint8Array): Transaction {
+  return parseTransactionBytes(raw, true);
+}
+
+/** Recovery observes existing funding bytes, not live version-2 funding policy. */
+export function parseRecoveryFundingTransaction(raw: Uint8Array): Transaction {
+  return parseTransactionBytes(raw, false);
+}
+
+function parseTransactionBytes(raw: Uint8Array, requireVersionTwo: boolean): Transaction {
   if (raw.length === 0 || raw.length > MAX_TRANSACTION_BYTES) throw new TransactionRefusedError("size unsupported");
   const reader = new Reader(raw);
   const version = reader.u32();
-  if (version !== 2) throw new TransactionRefusedError("version must be 2");
+  if (requireVersionTwo && version !== 2) throw new TransactionRefusedError("version must be 2");
   const segwit = raw[4] === 0x00;
   if (segwit && reader.take(2)[1] !== 0x01) throw new TransactionRefusedError("witness flag");
   const bare = readInputs(reader);

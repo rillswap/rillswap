@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 import canonicalize from "canonicalize";
 import type * as RefundActions from "../src/browserRefund";
 import type { RecoveryRefundCase } from "../unit/fixtures/recoveryRefundCases";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { parseTransaction, serializeTransaction } from "../src/swap/transaction";
+import type { RefundJournalDraft } from "../src/browserRefundJournal";
 
 declare global { interface Window { refundActions: typeof RefundActions } }
 const vector = (): RecoveryRefundCase => JSON.parse(readFileSync(new URL("../tmp/preview/test-only/recovery-refund-cases.json", import.meta.url), "utf8"))[0];
@@ -179,3 +183,102 @@ for (const race of ["withdraw during observation", "withdraw after UNKNOWN commi
     }
   });
 }
+
+for (const initialMode of ["legacy", "outpoint"]) {
+  for (const state of ["prepared", "submission-unknown", "accepted"]) {
+    test(`cross-mode ${initialMode} ${state} reauthorizes exact bytes, never re-signs or resubmits exposed intent`, async ({ page }) => {
+      await ready(page); const item = vector();
+      const termsOnly = structuredClone(item.record); termsOnly.funding_history = [];
+      const result = await page.evaluate(async ({ item, initialMode, state, plaintext, termsPlaintext }) => {
+        const network = item.expectedNetwork as { name: "regtest"; genesis_hash: string }, base = "http://127.0.0.1:8091/api";
+        const binding = item.record.funding_history[0]!.binding;
+        const legacy = { fundingAttemptId: item.fundingAttemptId, bindingRevision: 0 };
+        const outpoint = { kind: "outpoint" as const, fundingTxid: binding.funding_txid, fundingVout: binding.contract_vout };
+        const document = new TextEncoder().encode(plaintext);
+        const termsOnly = new TextEncoder().encode(termsPlaintext);
+        let posts = 0, reads = 0;
+        const transport = async (url: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+          if (init?.method === "POST") { posts++; throw new Error("lost response"); }
+          reads++; const path = String(url).slice(base.length + 1);
+          if (path === "block-height/0") return new Response(network.genesis_hash);
+          if (path === "blocks/tip/height") return new Response("1101");
+          if (path === "blocks/tip/hash") return new Response("a".repeat(64));
+          if (path === "block-height/1000") return new Response("d".repeat(64));
+          if (path.endsWith("/hex")) return new Response(item.fundingTxHex);
+          if (path.endsWith("/status")) return new Response(JSON.stringify({ confirmed: true, block_height: 1000, block_hash: "d".repeat(64) }));
+          if (path.endsWith("/outspend/0")) return new Response('{"spent":false}');
+          throw new Error("unexpected endpoint");
+        };
+        const options = { broadcastApi: base, fetch: transport, assertCurrent() {} };
+        const saved = await window.refundActions.prepareBrowserRefund(initialMode === "legacy" ? document : termsOnly, network,
+          initialMode === "legacy" ? legacy : outpoint, base, 100n, options);
+        const journal = await window.BrowserRefundJournal.open(); let stored = saved;
+        try {
+          if (state !== "prepared") stored = await journal.beginExposure(saved);
+          if (state === "accepted") stored = await journal.markAccepted(stored, stored.refund.txid);
+        } finally { journal.close(); }
+        const otherDocument = initialMode === "legacy" ? termsOnly : document;
+        const otherSelection = initialMode === "legacy" ? outpoint : legacy;
+        const original = crypto.getRandomValues.bind(crypto); let randomCalls = 0;
+        crypto.getRandomValues = ((array: Uint8Array) => { randomCalls++; return original(array); }) as typeof crypto.getRandomValues;
+        try {
+          const before = reads;
+          const loaded = await window.refundActions.prepareBrowserRefund(otherDocument, network, otherSelection, base, 100n, options);
+          const noReadOnLoad = before === reads;
+          let wrongFeeRefused = false;
+          try { await window.refundActions.prepareBrowserRefund(otherDocument, network, otherSelection, base, 101n, options); } catch { wrongFeeRefused = true; }
+          let refused = false;
+          if (state !== "prepared") {
+            try { await window.refundActions.broadcastBrowserRefund(otherDocument, network, otherSelection, base, loaded, options); } catch { refused = true; }
+            const exported = await window.refundActions.exportBrowserRefund(otherDocument, network, otherSelection, base, loaded, options);
+            if (exported.refund.transactionHex !== stored.refund.transactionHex) throw new Error("changed bytes");
+          }
+          let wrongOutputRefused = false;
+          try { await window.refundActions.exportBrowserRefund(termsOnly, network, { ...outpoint, fundingVout: 1 }, base, loaded, options); } catch { wrongOutputRefused = true; }
+          return { loaded, stored, randomCalls, posts, noReadOnLoad, refused, wrongOutputRefused, wrongFeeRefused };
+        } finally { crypto.getRandomValues = original; }
+      }, { item, initialMode, state, plaintext: canonicalize(item.record)!, termsPlaintext: canonicalize(termsOnly)! });
+      expect(result.loaded).toEqual(result.stored); expect(result.randomCalls).toBe(0); expect(result.posts).toBe(0);
+      expect(result.noReadOnLoad).toBe(true); expect(result.wrongOutputRefused).toBe(true);
+      expect(result.wrongFeeRefused).toBe(true);
+      if (state !== "prepared") expect(result.refused).toBe(true);
+    });
+  }
+}
+
+test("outpoint reauthorization rejects structurally intact tampered signed plans without clearing their exposure marker", async ({ page }) => {
+  await ready(page); const item = vector(); item.record.funding_history = [];
+  const input = JSON.parse(readFileSync(new URL("../tmp/preview/test-only/refund-journal-draft.json", import.meta.url), "utf8")) as RefundJournalDraft;
+  const saved = await page.evaluate(async (input) => {
+    const journal = await window.BrowserRefundJournal.open(); try { return await journal.prepare(input); } finally { journal.close(); }
+  }, input);
+  const transaction = parseTransaction(hexToBytes(saved.refund.transactionHex));
+  const witness = [...transaction.inputs[0]!.witness]; witness[0] = Uint8Array.from(witness[0]!); witness[0]![0] = witness[0]![0]! ^ 1;
+  const alternatives = [
+    { ...transaction, inputs: [{ ...transaction.inputs[0]!, witness }] },
+    { ...transaction, outputs: [{ ...transaction.outputs[0]!, value: transaction.outputs[0]!.value - 1n }] },
+  ];
+  for (const [index, tx] of alternatives.entries()) {
+    const raw = serializeTransaction(tx, true), parsed = parseTransaction(raw);
+    const corrupt = { ...saved, state: "submission-unknown" as const, signedDigest: bytesToHex(sha256(raw)),
+      refund: { ...saved.refund, transactionHex: bytesToHex(raw), txid: parsed.txid, outputValueSat: parsed.outputs[0]!.value.toString(), feeSat: index === 0 ? saved.refund.feeSat : (BigInt(saved.refund.feeSat) + 1n).toString() } };
+    const result = await page.evaluate(async ({ corrupt, plaintext, network }) => {
+      const db = await new Promise<IDBDatabase>((resolve) => { const r = indexedDB.open("rillswap-refund-submissions"); r.onsuccess = () => resolve(r.result); });
+      await new Promise<void>((resolve) => { const tx = db.transaction("intents", "readwrite"); tx.objectStore("intents").put(corrupt); tx.oncomplete = () => resolve(); });
+      const journal = await window.BrowserRefundJournal.open(); let calls = 0, refused = 0;
+      try {
+        const stored = (await journal.get(network, corrupt.refund.fundingTxid, corrupt.refund.fundingVout))!;
+        const document = new TextEncoder().encode(plaintext), selection = { kind: "outpoint" as const, fundingTxid: stored.refund.fundingTxid, fundingVout: stored.refund.fundingVout };
+        const options = { broadcastApi: stored.broadcastApi, assertCurrent() {}, fetch: async () => { calls++; throw new Error("no network allowed"); } };
+        for (const run of [
+          () => window.refundActions.prepareBrowserRefund(document, network, selection, stored.api, BigInt(stored.refund.feeSat), options),
+          () => window.refundActions.exportBrowserRefund(document, network, selection, stored.api, stored, options),
+          () => window.refundActions.broadcastBrowserRefund(document, network, selection, stored.api, stored, options),
+        ]) { try { await run(); } catch { refused++; } }
+        const after = await new Promise<unknown>((resolve) => { const r = db.transaction("intents").objectStore("intents").get(stored.id); r.onsuccess = () => resolve(r.result); });
+        return { calls, refused, stored, after };
+      } finally { journal.close(); db.close(); }
+    }, { corrupt, plaintext: canonicalize(item.record)!, network: item.expectedNetwork as { name: "regtest"; genesis_hash: string } });
+    expect(result.stored).toEqual(corrupt); expect(result.after).toEqual(corrupt); expect(result.refused).toBe(3); expect(result.calls).toBe(0);
+  }
+});

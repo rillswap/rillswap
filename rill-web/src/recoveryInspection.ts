@@ -27,7 +27,7 @@ import {
   handshakeHash, handshakeInitHash, jcs, providerTermsHash, taggedHash, unsignedEnvelopeHash,
 } from "./swap/hashes";
 import { reconstructTaprootContract, type TaprootContract } from "./swap/taproot";
-import { MAX_TRANSACTION_BYTES, parseTransaction, serializeTransaction, type Transaction } from "./swap/transaction";
+import { MAX_TRANSACTION_BYTES, parseRecoveryFundingTransaction, parseTransaction, serializeTransaction, type Transaction } from "./swap/transaction";
 import {
   COOPERATIVE_CLAIM_FEATURE, EPOCH_SESSION_EXTENSION, EPOCH_SESSION_FEATURE, MAX_SATS, sats, signedSats,
   verifySchnorr, type BtcToLnTerms, type LnToBtcTerms, type HandshakeAccept, type HandshakeInit,
@@ -331,9 +331,64 @@ export function inspectRecoveryPlaintext(plaintext: Uint8Array, independentlySel
     }))) });
 }
 
+export interface RecoveryDepositTarget {
+  readonly contractHash: string;
+  readonly scriptPubkey: string;
+  readonly nominalValueSat: string;
+  readonly birthdayHeight: number;
+}
+
+/** Authenticated public discovery hints, never an assertion that funding exists. */
+export function inspectRecoveryDepositTarget(
+  plaintext: Uint8Array, independentlySelectedNetwork: unknown,
+): RecoveryDepositTarget {
+  const record = authenticateRecovery(plaintext, independentlySelectedNetwork);
+  return Object.freeze({ contractHash: record.contract_hash, scriptPubkey: record.taproot_contract.script_pubkey,
+    nominalValueSat: record.contract_terms.economics.contract_amount_sat,
+    birthdayHeight: record.chain_scan_birthday_height });
+}
+
 export interface RecoveryFundingSelection {
   readonly fundingAttemptId: string;
   readonly bindingRevision: number;
+}
+
+/** An explicitly selected actual output, not a revision or a funder declaration. */
+export interface RecoveryOutpointSelection {
+  readonly kind: "outpoint";
+  readonly fundingTxid: string;
+  readonly fundingVout: number;
+}
+
+export type RecoveryRefundSelection = RecoveryFundingSelection | RecoveryOutpointSelection;
+type RecoveryContractOutput = Pick<HistoricalBinding,
+  "funding_txid" | "contract_vout" | "contract_value_sat" | "contract_script_pubkey">;
+
+function recoveryOutpoint(record: RecoveryRecord, selection: RecoveryOutpointSelection, raw: Uint8Array): RecoveryContractOutput {
+  require(selection.kind === "outpoint" && typeof selection.fundingTxid === "string" && /^[0-9a-f]{64}$/.test(selection.fundingTxid));
+  require(Number.isSafeInteger(selection.fundingVout) && selection.fundingVout >= 0 && selection.fundingVout <= 0xffffffff);
+  require(raw instanceof Uint8Array && raw.length > 0 && raw.length <= MAX_TRANSACTION_BYTES);
+  const transaction = parseRecoveryFundingTransaction(raw), output = transaction.outputs[selection.fundingVout];
+  require(transaction.txid === selection.fundingTxid && output !== undefined);
+  require(transaction.outputs.reduce((total, item) => total + item.value, 0n) <= MAX_SATS);
+  require(new Set(transaction.inputs.map((input) => `${input.txid}:${input.vout}`)).size === transaction.inputs.length);
+  require(bytesToHex(output!.script) === record.taproot_contract.script_pubkey);
+  return Object.freeze({ funding_txid: transaction.txid, contract_vout: selection.fundingVout,
+    contract_value_sat: output!.value.toString(), contract_script_pubkey: record.taproot_contract.script_pubkey });
+}
+
+/** Authenticate actual output bytes without inventing signed funding history. No live evidence. */
+export function checkRecoveryOutpointTransaction(
+  plaintext: Uint8Array, independentlySelectedNetwork: unknown, selection: RecoveryOutpointSelection, rawFundingTransaction: Uint8Array,
+): void {
+  try {
+    require(rawFundingTransaction instanceof Uint8Array && rawFundingTransaction.length > 0 && rawFundingTransaction.length <= MAX_TRANSACTION_BYTES);
+    const record = authenticateRecovery(plaintext, independentlySelectedNetwork);
+    require(isSupportedRecoveryNetwork(record.network_identity));
+    recoveryOutpoint(record, { ...selection }, Uint8Array.from(rawFundingTransaction));
+    return;
+  } catch { /* Never attach imported-document, parser, or output diagnostics. */ }
+  throw new RecoveryInspectionRefusedError();
 }
 
 function selectBinding(record: RecoveryRecord, selection: RecoveryFundingSelection): HistoricalBinding {
@@ -436,7 +491,7 @@ const refundScriptBytes = (script: Uint8Array): Uint8Array => {
 };
 
 /** BIP341 DEFAULT script-path spend (ext_flag 1, input 0, no annex). */
-function scriptPathSighash(binding: HistoricalBinding, leafHash: string, output: Transaction["outputs"][number], lockHeight: number): Uint8Array {
+function scriptPathSighash(binding: RecoveryContractOutput, leafHash: string, output: Transaction["outputs"][number], lockHeight: number): Uint8Array {
   const prevout = concatBytes(hexToBytes(binding.funding_txid).reverse(), refundU32(binding.contract_vout));
   const message = concatBytes(
     Uint8Array.of(0x00), // hash_type DEFAULT
@@ -453,7 +508,7 @@ function scriptPathSighash(binding: HistoricalBinding, leafHash: string, output:
 }
 
 /** Verify every spend byte and its signature against independently authenticated terms. */
-function authorizedRefund(record: RecoveryRecord, binding: HistoricalBinding, raw: Uint8Array): ConstructedRecoveryRefund {
+function authorizedRefund(record: RecoveryRecord, binding: RecoveryContractOutput, raw: Uint8Array): ConstructedRecoveryRefund {
   const parsed = parseTransaction(raw), terms = record.contract_terms;
   require(parsed.version === 2 && parsed.locktime === terms.refund_lock_height && parsed.inputs.length === 1 && parsed.outputs.length === 1);
   const input = parsed.inputs[0]!, output = parsed.outputs[0]!;
@@ -491,6 +546,22 @@ export function verifySelectedRecoveryRefund(
   throw new RecoveryRefundRefusedError();
 }
 
+/** Reauthorize exact saved refund bytes from authenticated terms and an actual output. */
+export function verifyRecoveryOutpointRefund(
+  plaintext: Uint8Array, independentlySelectedNetwork: unknown, selection: RecoveryOutpointSelection,
+  rawFundingTransaction: Uint8Array, signedRefund: Uint8Array,
+): ConstructedRecoveryRefund {
+  try {
+    require(rawFundingTransaction instanceof Uint8Array && rawFundingTransaction.length > 0 && rawFundingTransaction.length <= MAX_TRANSACTION_BYTES);
+    const record = authenticateRecovery(plaintext, independentlySelectedNetwork);
+    require(isSupportedRecoveryNetwork(record.network_identity));
+    require(signedRefund instanceof Uint8Array && signedRefund.length > 0 && signedRefund.length <= MAX_TRANSACTION_BYTES);
+    const output = recoveryOutpoint(record, { ...selection }, Uint8Array.from(rawFundingTransaction));
+    return authorizedRefund(record, output, Uint8Array.from(signedRefund));
+  } catch { /* No secret-bearing causes escape. */ }
+  throw new RecoveryRefundRefusedError();
+}
+
 /**
  * Disconnected selected-outpoint BTC to LN refund construction. Reauthenticates
  * bytes and checks the raw funding transaction, never trusts an inspection
@@ -504,17 +575,48 @@ export function verifySelectedRecoveryRefund(
 export function constructSelectedRecoveryRefund(
   plaintext: Uint8Array, independentlySelectedNetwork: unknown, input: SelectedRecoveryRefundInput,
 ): ConstructedRecoveryRefund {
-  let secret: Uint8Array | undefined, auxiliary: Uint8Array | undefined;
   try {
     const { fundingAttemptId, bindingRevision, sampledTipHeight, feeSat, rawFundingTransaction } = input;
     require(rawFundingTransaction instanceof Uint8Array && rawFundingTransaction.length > 0 && rawFundingTransaction.length <= MAX_TRANSACTION_BYTES);
     const rawFunding = Uint8Array.from(rawFundingTransaction);
-    require(Number.isSafeInteger(sampledTipHeight) && sampledTipHeight >= 0 && sampledTipHeight < 500_000_000);
-    require(typeof feeSat === "bigint" && feeSat >= 0n && feeSat <= MAX_SATS);
     const record = authenticateRecovery(plaintext, independentlySelectedNetwork);
     require(isSupportedRecoveryNetwork(record.network_identity));
-    const binding = selectBinding(record, { fundingAttemptId, bindingRevision }), terms = record.contract_terms;
+    const binding = selectBinding(record, { fundingAttemptId, bindingRevision });
     checkFundingTransaction(rawFunding, binding);
+    return signRecoveryRefund(record, binding, sampledTipHeight, feeSat);
+  } catch { /* Never expose document, signer, or parser errors or causes. */ }
+  throw new RecoveryRefundRefusedError();
+}
+
+export interface RecoveryOutpointRefundInput extends RecoveryOutpointSelection {
+  readonly rawFundingTransaction: Uint8Array;
+  readonly sampledTipHeight: number;
+  readonly feeSat: bigint;
+}
+
+/** Separately approved unilateral recovery, independent of provider/funder messages. */
+export function constructRecoveryOutpointRefund(
+  plaintext: Uint8Array, independentlySelectedNetwork: unknown, input: RecoveryOutpointRefundInput,
+): ConstructedRecoveryRefund {
+  try {
+    const { kind, fundingTxid, fundingVout, sampledTipHeight, feeSat, rawFundingTransaction } = input;
+    require(rawFundingTransaction instanceof Uint8Array && rawFundingTransaction.length > 0 && rawFundingTransaction.length <= MAX_TRANSACTION_BYTES);
+    const record = authenticateRecovery(plaintext, independentlySelectedNetwork);
+    require(isSupportedRecoveryNetwork(record.network_identity));
+    const output = recoveryOutpoint(record, { kind, fundingTxid, fundingVout }, Uint8Array.from(rawFundingTransaction));
+    return signRecoveryRefund(record, output, sampledTipHeight, feeSat);
+  } catch { /* No secret-bearing causes escape. */ }
+  throw new RecoveryRefundRefusedError();
+}
+
+function signRecoveryRefund(
+  record: RecoveryRecord, binding: RecoveryContractOutput, sampledTipHeight: number, feeSat: bigint,
+): ConstructedRecoveryRefund {
+  let secret: Uint8Array | undefined, auxiliary: Uint8Array | undefined;
+  try {
+    const terms = record.contract_terms;
+    require(Number.isSafeInteger(sampledTipHeight) && sampledTipHeight >= 0 && sampledTipHeight < 500_000_000);
+    require(typeof feeSat === "bigint" && feeSat >= 0n && feeSat <= MAX_SATS);
     require(sampledTipHeight > terms.refund_lock_height && feeSat <= BigInt(terms.max_refund_fee_sat));
     const destination = hexToBytes(terms.client_destination_script);
     const dust = destination.length === 22 ? 294n : 330n;
@@ -532,9 +634,7 @@ export function constructSelectedRecoveryRefund(
     transaction.inputs[0]!.witness = [signature, hexToBytes(record.taproot_contract.refund_script), hexToBytes(record.taproot_contract.refund_control_block)];
     const signed = serializeTransaction(transaction, true);
     return authorizedRefund(record, binding, signed);
-  } catch { /* Never expose document, signer, or parser errors or causes. */ }
-  finally { secret?.fill(0); auxiliary?.fill(0); }
-  throw new RecoveryRefundRefusedError();
+  } finally { secret?.fill(0); auxiliary?.fill(0); }
 }
 
 export const REVERSE_FALLBACK_EXTENSION = "rillswap/reverse-claim-fallback";

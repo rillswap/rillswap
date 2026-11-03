@@ -334,7 +334,9 @@ accepting the quote, send the exact amount to
 the displayed contract address from any native segwit wallet (a `bitcoin:`
 link and QR code are shown). Advanced users can supply a finalized PSBT. Do
 not send extra or multiple deposits: deposits that break the funding rules
-stop the swap and cannot currently be refunded from the panel. If the
+stop the live swap. The Recovery panel can refund matching escrow outputs
+individually after the signed timeout, including deposits rejected by the live
+flow. If the
 provider pays at zero confirmations, the page binds your payment as soon as it
 sees it. Do not bump its fee or replace it then: the replacement is not the
 bound transaction, and you can only refund it after the refund height.
@@ -446,15 +448,56 @@ CLI recovery files containing a reverse burn or preimage-disclosure record can
 also be opened. They are authenticated as historical evidence, not signing
 authority; a preexisting signed fallback remains UNKNOWN and export-only.
 
-- **Bitcoin to Lightning refunds:** use **Check funding**, wait until the
-  refund matures, review the destination and fee, then prepare, download
-  and broadcast as separate explicit steps. Exporting the signed refund
-  disables in-app broadcast.
+- **Bitcoin to Lightning refunds:** the original terms-stage backup works even
+  with **0 recorded funding revisions** and an unavailable provider. Choose
+  **Find deposits**, or enter the deposit transaction ID if the address search
+  fails or misses it. Lookup discloses the public escrow address or transaction
+  ID to your selected chain API, never the file or key. Explicitly select an
+  output, use **Check funding**, and wait for a tip above the signed refund lock.
+  Review the fixed refund address, actual output value, and total fee, then
+  approve preparation. **Broadcast refund** submits the saved bytes once;
+  **Download signed transaction** instead allows external broadcast and disables
+  in-app broadcast. Neither opening a file nor finding a deposit signs anything.
 - **Stablecoin to Lightning:** the wallet can refund after the contract
   timelock.
 - **Lightning to stablecoin:** an unexposed swap can be claimed from the same
   browser. In another browser the imported file is inspection-only.
 
+Deposit discovery returns candidates, not proof of confirmed or unspent funds.
+The bounded address search reads at most 8 pages and 200 transactions, with at
+most 32 matching outputs and a 20-second deadline. Missing, incomplete, or empty
+API history never proves no deposit exists; use the transaction-ID fallback or
+another API. An explicit transaction-ID lookup can list all matching outputs
+within the transaction parser's bounds. This is not a full-chain scan from the
+backup's birthday. The funding check repeats raw-byte, confirmed inclusion, active-block, unspent
+(including the API's mempool), and stable-tip checks before signing or first exposure.
+These remain observations from one trusted API, not independent consensus proof.
+
+Independent outpoint recovery uses each output's **actual value**, not the quoted
+swap amount. It accepts funding versions other than 2, legacy inputs, arbitrary
+change scripts, and multiple escrow outputs, each separately selected. The
+signed destination, absolute fee cap, dust floor, refund lock and refund-byte
+validation still apply. Coinbase funding and transactions beyond the parser's
+byte/item limits remain unsupported. The existing signed-revision APIs stay
+strict; Python core/CLI recovery still requires recorded bindings and the
+nominal amount. No provider acknowledgment or invented funding revision is used.
+
+After the timeout both spend paths can race: a provider that learned the payment
+preimage may still claim. Check your Lightning wallet. A fresh unspent response
+cannot guarantee that a competing spend will not arrive.
+
+Upgrades leave existing saved refund intents unchanged, including exact signed
+bytes and exposure markers. New outpoint intents have a separate tagged shape
+in the same store, with no migration or backfill. Both selection modes share one
+network/outpoint identity and reuse the stored intent after reauthorization.
+Prepared intents can be exposed once; unknown or accepted intents allow only
+identical manual re-export, never another application POST. Malformed records
+are preserved and refused, not repaired. An older build refuses new tagged
+intents without overwriting them. A missing local record proves nothing about
+refunds exposed on another origin or device. Localhost is a separate origin, so
+bring the original encrypted swap file and its saved recovery key.
+
+For files with recorded funding bindings and policy-compliant nominal outputs,
 Bitcoin refunds also work with [rill-cli](../rill-cli/README.md) and a synced
 Bitcoin Core node: download `rillswap-recovery.age-key` from the recovery
 details and pass it as `--identity` to `rill recover watch-refund` or

@@ -10,6 +10,12 @@ async function prepare(page: Page, input = draft()): Promise<RefundJournalRecord
   return page.evaluate(async (input) => { const journal = await window.BrowserRefundJournal.open(); try { return await journal.prepare(input); } finally { journal.close(); } }, input);
 }
 
+function outpointDraft(): RefundJournalDraft {
+  const input = draft();
+  return { networkIdentity: input.networkIdentity, api: input.api, broadcastApi: input.broadcastApi,
+    rawFundingTransactionHex: input.rawFundingTransactionHex, refund: input.refund, selection: "outpoint" };
+}
+
 test("explicit preparation survives reopening, snapshots caller inputs, and keeps only public immutable intent fields", async ({ page }) => {
   await ready(page);
   const saved = await prepare(page);
@@ -224,4 +230,70 @@ test("drafts are snapshotted immediately and refused corrupted entries remain by
   }, draft());
   expect(result.saved.api).toBe(draft().api); expect(result.saved.refund).toEqual(draft().refund);
   expect(result.after).toEqual(result.corrupt);
+});
+
+for (const mode of ["legacy", "outpoint"]) {
+  test(`${mode} records keep their exact stored shape through exposure and acceptance without migration`, async ({ page }) => {
+    await ready(page); const saved = await prepare(page, mode === "legacy" ? draft() : outpointDraft());
+    const expectedKeys = mode === "legacy" ? Object.keys(saved).sort() :
+      ["api", "broadcastApi", "createdAt", "id", "networkIdentity", "rawFundingTransactionHex", "refund", "selection", "signedDigest", "state", "updatedAt"];
+    expect(Object.keys(saved).sort()).toEqual(expectedKeys);
+    const records = await page.evaluate(async (saved) => {
+      const journal = await window.BrowserRefundJournal.open();
+      const db = await new Promise<IDBDatabase>((resolve) => { const r = indexedDB.open("rillswap-refund-submissions"); r.onsuccess = () => resolve(r.result); });
+      const raw = () => new Promise<RefundJournalRecord>((resolve) => { const r = db.transaction("intents").objectStore("intents").get(saved.id); r.onsuccess = () => resolve(r.result); });
+      try {
+        const before = await raw(), exposed = await journal.beginExposure(saved), unknown = await raw();
+        await journal.markAccepted(exposed, exposed.refund.txid);
+        return [before, unknown, await raw()];
+      } finally { journal.close(); db.close(); }
+    }, saved);
+    expect(records.map((r) => r.state)).toEqual(["prepared", "submission-unknown", "accepted"]);
+    for (const record of records) {
+      expect(Object.keys(record).sort()).toEqual(expectedKeys);
+      expect(record.refund).toEqual(saved.refund); expect(record.signedDigest).toBe(saved.signedDigest);
+    }
+  });
+}
+
+test("mixed selector shapes and unknown tags are refused without rewriting raw records", async ({ page }) => {
+  await ready(page); const saved = await prepare(page), alternative = outpointDraft();
+  const independent = { ...alternative, id: saved.id, signedDigest: saved.signedDigest, createdAt: saved.createdAt, updatedAt: saved.updatedAt, state: saved.state };
+  for (const corrupt of [{ ...saved, selection: "outpoint" }, { ...saved, ...alternative, selection: "outpoint" },
+    { ...independent, selection: "unknown" }]) {
+    const result = await page.evaluate(async ({ corrupt, saved, input }) => {
+      const db = await new Promise<IDBDatabase>((resolve) => { const r = indexedDB.open("rillswap-refund-submissions"); r.onsuccess = () => resolve(r.result); });
+      await new Promise<void>((resolve) => { const tx = db.transaction("intents", "readwrite"); tx.objectStore("intents").put(corrupt); tx.oncomplete = () => resolve(); });
+      const journal = await window.BrowserRefundJournal.open(); let refused = 0;
+      try {
+        for (const run of [() => journal.get(saved.networkIdentity, saved.refund.fundingTxid, saved.refund.fundingVout), () => journal.prepare(input), () => journal.beginExposure(saved)]) {
+          try { await run(); } catch { refused++; }
+        }
+        const after = await new Promise<unknown>((resolve) => { const r = db.transaction("intents").objectStore("intents").get(saved.id); r.onsuccess = () => resolve(r.result); });
+        return { refused, after };
+      } finally { journal.close(); db.close(); }
+    }, { corrupt, saved, input: alternative });
+    expect(result.refused).toBe(3); expect(result.after).toEqual(corrupt);
+  }
+  // Rollback refusal follows from the old build's closed legacy key set, not an executed old-build test.
+});
+
+test("cross-mode preparations race for one outpoint and neither mode can re-expose UNKNOWN", async ({ page, context }) => {
+  await ready(page); const second = await context.newPage(); await ready(second);
+  const attempt = (tab: Page, input: RefundJournalDraft) => prepare(tab, input).catch(() => null);
+  const outcomes = await Promise.all([attempt(page, draft()), attempt(second, outpointDraft())]);
+  expect(outcomes.filter(Boolean)).toHaveLength(1);
+  const saved = outcomes.find(Boolean)!;
+  const exposed = await page.evaluate(async (saved) => {
+    const journal = await window.BrowserRefundJournal.open(); try { return await journal.beginExposure(saved); } finally { journal.close(); }
+  }, saved);
+  const result = await second.evaluate(async (saved) => {
+    const journal = await window.BrowserRefundJournal.open();
+    try {
+      const loaded = (await journal.get(saved.networkIdentity, saved.refund.fundingTxid, saved.refund.fundingVout))!;
+      let replay = false; try { await journal.beginExposure(loaded); replay = true; } catch {}
+      return { loaded, replay, exported: await journal.reexportIdentical(loaded) };
+    } finally { journal.close(); }
+  }, saved);
+  expect(result.loaded).toEqual(exposed); expect(result.replay).toBe(false); expect(result.exported.refund).toEqual(saved.refund);
 });

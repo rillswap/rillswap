@@ -8,6 +8,8 @@ import { swapLinkFragment } from "../src/swapLink";
 import type { RecoveryRefundCase } from "../unit/fixtures/recoveryRefundCases";
 import type { BrowserRefundJournal } from "../src/browserRefundJournal";
 import { testInvoice } from "../../rill-payments/tests/helpers";
+import { hexToBytes } from "@noble/hashes/utils.js";
+import { parseRecoveryFundingTransaction, parseTransaction } from "../src/swap/transaction";
 
 declare global { interface Window { uiRefundJournal: typeof BrowserRefundJournal; refundExposurePending: boolean; releaseRefundExposure: () => void } }
 
@@ -29,6 +31,7 @@ async function importRecord(page: Page, item: RecoveryRefundCase): Promise<void>
 
 async function chainApi(page: Page, item: RecoveryRefundCase, tip = 1101, pause?: () => Promise<void>) {
   const calls: string[] = [];
+  const fundingTxid = item.record.funding_history[item.bindingRevision]?.binding.funding_txid ?? parseRecoveryFundingTransaction(hexToBytes(item.fundingTxHex)).txid;
   await page.route(`${BASE}/**`, async (route) => {
     const request = route.request(), path = new URL(request.url()).pathname.slice(5);
     calls.push(path);
@@ -40,7 +43,7 @@ async function chainApi(page: Page, item: RecoveryRefundCase, tip = 1101, pause?
     else if (path === "blocks/tip/height") body = String(tip);
     else if (path === "blocks/tip/hash") body = "a".repeat(64);
     else if (path === "block-height/1000") body = "d".repeat(64);
-    else if (path === `tx/${item.record.funding_history[item.bindingRevision]!.binding.funding_txid}/hex`) body = item.fundingTxHex;
+    else if (path === `tx/${fundingTxid}/hex`) body = item.fundingTxHex;
     else if (path.endsWith("/status")) body = JSON.stringify({ confirmed: true, block_height: 1000, block_hash: "d".repeat(64) });
     else if (path.endsWith("/outspend/0")) body = '{"spent":false}';
     await route.fulfill({ status: body ? 200 : 404, body: body ?? "Unknown fixture transaction", headers: {
@@ -369,13 +372,66 @@ test("a failed observation acknowledges no signing/broadcast without denying the
   expect(calls.some((path) => path.endsWith("/hex"))).toBe(true);
 });
 
-test("zero funding history never exposes a funding check or makes a chain connection", async ({ page }) => {
+test("terms-only recovery offers discovery without connecting or selecting an output on import", async ({ page }) => {
   const item = structuredClone(corpus()[0]!); item.record.funding_history = [];
   const calls = await chainApi(page, item);
   await page.goto("http://127.0.0.1:18765/test-only/swap.html"); await importRecord(page, item);
   await expect(page.locator("#swap-recovery-result")).toContainText("0 recorded funding revisions");
-  await expect(page.locator("#swap-recovery-funding-controls")).not.toBeVisible();
+  await expect(page.locator("#swap-recovery-funding-controls")).toBeVisible();
+  await expect(page.locator("#swap-recovery-find-deposits")).toBeEnabled();
+  await expect(page.locator("#swap-recovery-deposit-txid")).toBeVisible();
+  await expect(page.locator("#swap-recovery-check-funding")).toBeDisabled();
+  await expect(page.locator("#swap-refund-prepare")).toBeDisabled();
   expect(calls).toEqual([]);
+});
+
+for (const name of ["P2WPKH refund", "funding wrong contract value", "funding duplicate contract outputs"]) {
+  test(`original terms backup discovers and refunds explicitly selected actual outputs: ${name}`, async ({ page }, testInfo) => {
+    const item = corpus().find((c) => c.name === name)!; item.record.funding_history = [];
+    const funding = parseRecoveryFundingTransaction(hexToBytes(item.fundingTxHex));
+    await chainApi(page, item);
+    await page.route(`${BASE}/address/**`, (route) => route.fulfill({ status: 200, json: [{ txid: funding.txid, status: { confirmed: true } }], headers: { "Access-Control-Allow-Origin": "http://127.0.0.1:18765" } }));
+    await page.route(`${BASE}/tx/*/outspend/*`, (route) => route.fulfill({ status: 200, json: { spent: false }, headers: { "Access-Control-Allow-Origin": "http://127.0.0.1:18765" } }));
+    await page.goto("http://127.0.0.1:18765/test-only/swap.html"); await importRecord(page, item);
+    await page.locator("#swap-recovery-find-deposits").click();
+    await expect(page.locator("#swap-recovery-discovery-result")).toContainText("matching output");
+    await expect(page.locator("#swap-recovery-revision")).toHaveValue("");
+    await expect(page.locator("#swap-refund-prepare")).toBeDisabled();
+    for (const fundingVout of name === "funding duplicate contract outputs" ? [0, 2] : [0]) {
+      await page.locator("#swap-recovery-revision").selectOption(`outpoint:${funding.txid}:${fundingVout}`);
+      await expect(page.locator("#swap-refund-amount")).toContainText(`Selected output value: ${funding.outputs[fundingVout]!.value} sat`);
+      await page.locator("#swap-recovery-check-funding").click();
+      await expect(page.locator("#swap-recovery-funding-result h3")).toHaveText("Funding observed by your API");
+      await page.locator("#swap-refund-prepare").click();
+      await expect(page.locator("#swap-refund-result h3")).toHaveText("Refund prepared and saved");
+      const downloading = page.waitForEvent("download"); await page.locator("#swap-refund-download").click();
+      const path = testInfo.outputPath(`outpoint-${fundingVout}.hex`); await (await downloading).saveAs(path);
+      const refund = parseTransaction(hexToBytes(readFileSync(path, "utf8").trim()));
+      expect(refund.inputs[0]!.txid).toBe(funding.txid); expect(refund.inputs[0]!.vout).toBe(fundingVout);
+      expect(refund.outputs[0]!.value).toBe(funding.outputs[fundingVout]!.value - 300n);
+      await expect(page.locator("#swap-refund-broadcast")).toBeHidden();
+    }
+    await expect(page.locator("#swap-recovery-result")).toContainText("0 recorded funding revisions");
+  });
+}
+
+test("terms-only TXID fallback works without address history and empty lookup never claims funds are absent", async ({ page }) => {
+  const item = corpus()[0]!; item.record.funding_history = [];
+  const fundingTxid = parseRecoveryFundingTransaction(hexToBytes(item.fundingTxHex)).txid;
+  const calls = await chainApi(page, item);
+  await page.route(`${BASE}/address/**`, (route) => route.fulfill({ status: 200, json: [], headers: { "Access-Control-Allow-Origin": "http://127.0.0.1:18765" } }));
+  await page.goto("http://127.0.0.1:18765/test-only/swap.html"); await importRecord(page, item);
+  await page.locator("#swap-recovery-find-deposits").click();
+  await expect(page.locator("#swap-recovery-discovery-result")).toContainText("not proof that no deposit exists");
+  await expect(page.locator("#swap-refund-prepare")).toBeDisabled();
+  calls.length = 0;
+  await page.locator("#swap-recovery-deposit-txid").fill(fundingTxid);
+  await page.locator("#swap-recovery-find-deposits").click();
+  await expect(page.locator("#swap-recovery-discovery-result")).toContainText("Only the supplied transaction was checked");
+  expect(calls.some((p) => p.startsWith("address/"))).toBe(false);
+  await page.locator("#swap-recovery-revision").selectOption(`outpoint:${fundingTxid}:0`);
+  await page.locator("#swap-refund-prepare").click();
+  await expect(page.locator("#swap-refund-result h3")).toHaveText("Refund prepared and saved");
 });
 
 test("production CSP lets mainnet recovery checks use the user's own https mempool instance", async ({ page }) => {

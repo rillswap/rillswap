@@ -8,7 +8,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import { isSupportedRecoveryNetwork, type ConstructedRecoveryRefund } from "./recoveryInspection";
 import { validateMempoolApi, type NetworkName } from "./swap/config";
-import { MAX_TRANSACTION_BYTES, parseTransaction, serializeTransaction } from "./swap/transaction";
+import { MAX_TRANSACTION_BYTES, parseRecoveryFundingTransaction, parseTransaction, serializeTransaction } from "./swap/transaction";
 
 const DATABASE = "rillswap-refund-submissions";
 const STORE = "intents";
@@ -17,24 +17,27 @@ const encoder = new TextEncoder();
 const MAX_SATS = 2100000000000000n;
 
 export type RefundSubmissionState = "prepared" | "submission-unknown" | "accepted";
-export interface RefundJournalDraft {
+interface RefundJournalCommon {
   readonly networkIdentity: unknown;
   readonly api: string;
   readonly broadcastApi: string;
-  readonly fundingAttemptId: string;
-  readonly bindingRevision: number;
   /** Public transaction bytes, retained for offline reauthorization, never UTXO proof. */
   readonly rawFundingTransactionHex: string;
   readonly refund: ConstructedRecoveryRefund;
 }
 
-export interface RefundJournalRecord extends RefundJournalDraft {
+/** Legacy records retain their exact shape; independent selections never invent revision metadata. */
+export type RefundJournalDraft = RefundJournalCommon & (
+  { readonly fundingAttemptId: string; readonly bindingRevision: number } | { readonly selection: "outpoint" }
+);
+
+export type RefundJournalRecord = RefundJournalDraft & {
   readonly id: string;
   readonly signedDigest: string;
   readonly createdAt: number;
   readonly updatedAt: number;
   readonly state: RefundSubmissionState;
-}
+};
 
 export class RefundJournalRefusedError extends Error {
   constructor() {
@@ -73,7 +76,7 @@ function recordId(network: unknown, txid: string, vout: number): string {
 
 /** Integrity checks only, not ownership, UTXO evidence, or signature authorization. */
 function draftSnapshot(value: unknown): RefundJournalDraft {
-  const draft = object(value, ["networkIdentity", "api", "broadcastApi", "fundingAttemptId", "bindingRevision", "rawFundingTransactionHex", "refund"]);
+  const draft = object(value, draftFields(value));
   const networkIdentity = snapshotNetwork(draft.networkIdentity);
   require(typeof draft.api === "string");
   const api = validateMempoolApi(draft.api as string, networkIdentity.name as NetworkName);
@@ -81,8 +84,14 @@ function draftSnapshot(value: unknown): RefundJournalDraft {
   require(typeof draft.broadcastApi === "string");
   const broadcastApi = validateMempoolApi(draft.broadcastApi as string, networkIdentity.name as NetworkName);
   require(broadcastApi === draft.broadcastApi);
-  require(typeof draft.fundingAttemptId === "string" && HEX32.test(draft.fundingAttemptId));
-  require(integer(draft.bindingRevision, 0, 63));
+  let selector: { readonly selection: "outpoint" } | { readonly fundingAttemptId: string; readonly bindingRevision: number };
+  if (Object.hasOwn(draft, "selection")) {
+    require(draft.selection === "outpoint"); selector = { selection: "outpoint" };
+  } else {
+    require(typeof draft.fundingAttemptId === "string" && HEX32.test(draft.fundingAttemptId));
+    require(integer(draft.bindingRevision, 0, 63));
+    selector = { fundingAttemptId: draft.fundingAttemptId as string, bindingRevision: draft.bindingRevision as number };
+  }
   const data = object(draft.refund, ["transactionHex", "txid", "contractHash", "fundingTxid", "fundingVout", "destinationScript", "refundLockHeight", "feeSat", "outputValueSat", "vsize"]);
   const transactionHex = hex(data.transactionHex, 60, MAX_TRANSACTION_BYTES);
   const transaction = parseTransaction(hexToBytes(transactionHex));
@@ -100,7 +109,7 @@ function draftSnapshot(value: unknown): RefundJournalDraft {
   const baseSize = serializeTransaction(transaction, false).length;
   require(data.vsize === Math.ceil((baseSize * 3 + transaction.raw.length) / 4));
   const rawFundingTransactionHex = hex(draft.rawFundingTransactionHex, 60, MAX_TRANSACTION_BYTES);
-  const funding = parseTransaction(hexToBytes(rawFundingTransactionHex));
+  const funding = ("selection" in selector ? parseRecoveryFundingTransaction : parseTransaction)(hexToBytes(rawFundingTransactionHex));
   require(funding.txid === data.fundingTxid);
   const prevout = funding.outputs[data.fundingVout as number];
   require(prevout !== undefined && prevout.value === fee + outputValue && /^5120[0-9a-f]{64}$/.test(bytesToHex(prevout.script)));
@@ -108,14 +117,19 @@ function draftSnapshot(value: unknown): RefundJournalDraft {
     fundingTxid: data.fundingTxid as string, fundingVout: data.fundingVout as number, destinationScript,
     refundLockHeight: data.refundLockHeight as number, feeSat: data.feeSat as string, outputValueSat: data.outputValueSat as string,
     vsize: data.vsize as number });
-  return Object.freeze({ networkIdentity, api, broadcastApi, fundingAttemptId: draft.fundingAttemptId as string, bindingRevision: draft.bindingRevision as number,
+  return Object.freeze({ networkIdentity, api, broadcastApi, ...selector,
     rawFundingTransactionHex, refund });
 }
 
+function draftFields(value: unknown): readonly string[] {
+  const outpoint = value !== null && typeof value === "object" && Object.hasOwn(value, "selection");
+  return ["networkIdentity", "api", "broadcastApi", ...(outpoint ? ["selection"] : ["fundingAttemptId", "bindingRevision"]), "rawFundingTransactionHex", "refund"];
+}
+
 function validateRecord(value: unknown): RefundJournalRecord {
-  const data = object(value, ["id", "signedDigest", "createdAt", "updatedAt", "state", "networkIdentity", "api", "broadcastApi", "fundingAttemptId", "bindingRevision", "rawFundingTransactionHex", "refund"]);
-  const draft = draftSnapshot({ networkIdentity: data.networkIdentity, api: data.api, broadcastApi: data.broadcastApi, fundingAttemptId: data.fundingAttemptId,
-    bindingRevision: data.bindingRevision, rawFundingTransactionHex: data.rawFundingTransactionHex, refund: data.refund });
+  const data = object(value, ["id", "signedDigest", "createdAt", "updatedAt", "state", ...draftFields(value)]);
+  const { id: _id, signedDigest: _digest, createdAt: _created, updatedAt: _updated, state: _state, ...draftData } = data;
+  const draft = draftSnapshot(draftData);
   require(data.id === recordId(draft.networkIdentity, draft.refund.fundingTxid, draft.refund.fundingVout));
   require(data.signedDigest === bytesToHex(sha256(hexToBytes(draft.refund.transactionHex))));
   require(integer(data.createdAt, 0, Number.MAX_SAFE_INTEGER) && integer(data.updatedAt, data.createdAt as number, Number.MAX_SAFE_INTEGER));
@@ -125,8 +139,9 @@ function validateRecord(value: unknown): RefundJournalRecord {
 }
 
 function sameDraft(record: RefundJournalRecord, draft: RefundJournalDraft): boolean {
-  const project = (item: RefundJournalDraft) => ({ networkIdentity: item.networkIdentity, api: item.api, broadcastApi: item.broadcastApi, fundingAttemptId: item.fundingAttemptId,
-    bindingRevision: item.bindingRevision, rawFundingTransactionHex: item.rawFundingTransactionHex, refund: item.refund });
+  const project = (item: RefundJournalDraft) => ({ networkIdentity: item.networkIdentity, api: item.api, broadcastApi: item.broadcastApi,
+    ...("selection" in item ? { selection: item.selection } : { fundingAttemptId: item.fundingAttemptId, bindingRevision: item.bindingRevision }),
+    rawFundingTransactionHex: item.rawFundingTransactionHex, refund: item.refund });
   return canonicalize(project(record)) === canonicalize(project(draft));
 }
 

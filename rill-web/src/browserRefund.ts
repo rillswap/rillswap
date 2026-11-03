@@ -2,8 +2,8 @@
 import canonicalize from "canonicalize";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { BrowserRefundJournal, type RefundJournalRecord } from "./browserRefundJournal";
-import { constructSelectedRecoveryRefund, inspectRecoveryPlaintext, verifySelectedRecoveryRefund, type RecoveryFundingSelection } from "./recoveryInspection";
-import { observeRecoveryFunding } from "./recoveryFunding";
+import { constructRecoveryOutpointRefund, constructSelectedRecoveryRefund, inspectRecoveryPlaintext, verifyRecoveryOutpointRefund, verifySelectedRecoveryRefund, type RecoveryRefundSelection } from "./recoveryInspection";
+import { observeRecoveryFunding, observeRecoveryOutpoint } from "./recoveryFunding";
 import { readBoundedChainText, type ChainFetch } from "./swap/chainTip";
 import { validateMempoolApi, type NetworkName } from "./swap/config";
 import { MAX_RECOVERY_PLAINTEXT_BYTES } from "./recoveryAgeContainer";
@@ -24,15 +24,23 @@ function documentSnapshot(value: Uint8Array): Uint8Array {
   require(value instanceof Uint8Array && value.length > 0 && value.length <= MAX_RECOVERY_PLAINTEXT_BYTES);
   return Uint8Array.from(value);
 }
-function reauthorize(document: Uint8Array, network: Network, selection: RecoveryFundingSelection, api: string, record: RefundJournalRecord): void {
-  require(canonicalize(record.networkIdentity) === canonicalize(network) && record.api === api && record.fundingAttemptId === selection.fundingAttemptId && record.bindingRevision === selection.bindingRevision);
-  const verified = verifySelectedRecoveryRefund(document, network, selection, hexToBytes(record.rawFundingTransactionHex), hexToBytes(record.refund.transactionHex));
+function reauthorize(document: Uint8Array, network: Network, selection: RecoveryRefundSelection, api: string, record: RefundJournalRecord): void {
+  require(canonicalize(record.networkIdentity) === canonicalize(network) && record.api === api);
+  if (!("kind" in selection) && !("selection" in record)) {
+    require(record.fundingAttemptId === selection.fundingAttemptId && record.bindingRevision === selection.bindingRevision);
+  }
+  // Cross-mode loading preserves the exact stored variant, bytes and exposure state.
+  // Each mode still authenticates its own selected actual output against the original document.
+  // History-mode admission remains strict, so non-policy deposits stay outpoint-mode only.
+  const verified = "kind" in selection ?
+    verifyRecoveryOutpointRefund(document, network, selection, hexToBytes(record.rawFundingTransactionHex), hexToBytes(record.refund.transactionHex)) :
+    verifySelectedRecoveryRefund(document, network, selection, hexToBytes(record.rawFundingTransactionHex), hexToBytes(record.refund.transactionHex));
   require(canonicalize(verified) === canonicalize(record.refund));
 }
 
 /** Called only after explicit destination/fee approval, never on import, page load, or polling. */
 export async function prepareBrowserRefund(
-  plaintext: Uint8Array, independentNetwork: Network, selection: RecoveryFundingSelection, base: string, feeSat: bigint, options: ApprovedAction,
+  plaintext: Uint8Array, independentNetwork: Network, selection: RecoveryRefundSelection, base: string, feeSat: bigint, options: ApprovedAction,
 ): Promise<RefundJournalRecord> {
   let document: Uint8Array | undefined, journal: BrowserRefundJournal | undefined;
   try {
@@ -42,12 +50,19 @@ export async function prepareBrowserRefund(
     require(typeof options.broadcastApi === "string");
     const broadcastApi = validateMempoolApi(options.broadcastApi!, network.name);
     const report = inspectRecoveryPlaintext(document, network);
-    const matches = report.fundingHistory.filter((b) => b.funding_attempt_id === chosen.fundingAttemptId && b.binding_revision === chosen.bindingRevision);
-    require(matches.length === 1 && typeof feeSat === "bigint" && feeSat >= 0n && feeSat <= BigInt(report.maxRefundFeeSat));
+    require(typeof feeSat === "bigint" && feeSat >= 0n && feeSat <= BigInt(report.maxRefundFeeSat));
+    let fundingTxid: string, fundingVout: number;
+    if ("kind" in chosen) {
+      require(chosen.kind === "outpoint" && /^[0-9a-f]{64}$/.test(chosen.fundingTxid) && Number.isSafeInteger(chosen.fundingVout) && chosen.fundingVout >= 0 && chosen.fundingVout <= 0xffffffff);
+      fundingTxid = chosen.fundingTxid; fundingVout = chosen.fundingVout;
+    } else {
+      const matches = report.fundingHistory.filter((b) => b.funding_attempt_id === chosen.fundingAttemptId && b.binding_revision === chosen.bindingRevision);
+      require(matches.length === 1);
+      fundingTxid = matches[0]!.funding_txid; fundingVout = matches[0]!.contract_vout;
+    }
     options.assertCurrent(); options.signal?.throwIfAborted();
     journal = await BrowserRefundJournal.open();
-    const binding = matches[0]!;
-    const stored = await journal.get(network, binding.funding_txid, binding.contract_vout);
+    const stored = await journal.get(network, fundingTxid, fundingVout);
     options.assertCurrent(); options.signal?.throwIfAborted();
     if (stored) {
       reauthorize(document, network, chosen, api, stored);
@@ -55,20 +70,28 @@ export async function prepareBrowserRefund(
       require(stored.broadcastApi === broadcastApi);
       return stored; // Never re-sign a saved plan, including an ambiguous exposed plan.
     }
-    const observation = await observeRecoveryFunding(document, network, chosen, api, options);
+    const observation = await observeSelected(document, network, chosen, api, options);
     require(observation.refundMatureAtObservedTip);
     options.assertCurrent(); options.signal?.throwIfAborted();
-    const refund = constructSelectedRecoveryRefund(document, network, { ...chosen, rawFundingTransaction: hexToBytes(observation.rawFundingTransactionHex), sampledTipHeight: observation.tipHeight, feeSat });
+    const input = { rawFundingTransaction: hexToBytes(observation.rawFundingTransactionHex), sampledTipHeight: observation.tipHeight, feeSat };
+    const refund = "kind" in chosen ? constructRecoveryOutpointRefund(document, network, { ...chosen, ...input }) :
+      constructSelectedRecoveryRefund(document, network, { ...chosen, ...input });
     options.assertCurrent(); options.signal?.throwIfAborted();
-    return await journal.prepare({ networkIdentity: network, api, broadcastApi, ...chosen, rawFundingTransactionHex: observation.rawFundingTransactionHex, refund });
+    return await journal.prepare({ networkIdentity: network, api, broadcastApi,
+      ...("kind" in chosen ? { selection: "outpoint" as const } : chosen), rawFundingTransactionHex: observation.rawFundingTransactionHex, refund });
   } catch { /* Redact all crypto, imported-document, storage, and endpoint errors. */ }
   finally { journal?.close(); document?.fill(0); }
   throw new BrowserRefundRefusedError();
 }
 
+function observeSelected(document: Uint8Array, network: Network, selection: RecoveryRefundSelection, api: string, options: ApprovedAction) {
+  return "kind" in selection ? observeRecoveryOutpoint(document, network, selection, api, options) :
+    observeRecoveryFunding(document, network, selection, api, options);
+}
+
 /** Manual identical-byte export remains available after UNKNOWN/accepted, without authorizing a POST. */
 export async function exportBrowserRefund(
-  plaintext: Uint8Array, independentNetwork: Network, selection: RecoveryFundingSelection, base: string, expected: RefundJournalRecord, options: ApprovedAction,
+  plaintext: Uint8Array, independentNetwork: Network, selection: RecoveryRefundSelection, base: string, expected: RefundJournalRecord, options: ApprovedAction,
 ): Promise<RefundJournalRecord> {
   let document: Uint8Array | undefined, journal: BrowserRefundJournal | undefined;
   try {
@@ -81,7 +104,7 @@ export async function exportBrowserRefund(
     options.assertCurrent(); options.signal?.throwIfAborted();
     journal = await BrowserRefundJournal.open();
     if (record.state !== "prepared") return await journal.reexportIdentical(record);
-    const observation = await observeRecoveryFunding(document, network, chosen, api, options);
+    const observation = await observeSelected(document, network, chosen, api, options);
     require(observation.refundMatureAtObservedTip && observation.rawFundingTransactionHex === record.rawFundingTransactionHex);
     options.assertCurrent(); options.signal?.throwIfAborted();
     return await journal.beginExposure(record);
@@ -94,7 +117,7 @@ export interface RefundBroadcastOutcome { readonly outcome: "accepted" | "unknow
 
 /** One POST, only following this invocation's successful atomic exposure transition. */
 export async function broadcastBrowserRefund(
-  plaintext: Uint8Array, independentNetwork: Network, selection: RecoveryFundingSelection, base: string, expected: RefundJournalRecord, options: ApprovedAction,
+  plaintext: Uint8Array, independentNetwork: Network, selection: RecoveryRefundSelection, base: string, expected: RefundJournalRecord, options: ApprovedAction,
 ): Promise<RefundBroadcastOutcome> {
   let document: Uint8Array | undefined, journal: BrowserRefundJournal | undefined;
   try {
@@ -106,7 +129,7 @@ export async function broadcastBrowserRefund(
     reauthorize(document, network, chosen, api, record);
     require(validateMempoolApi(options.broadcastApi, network.name) === record.broadcastApi);
     options.assertCurrent(); options.signal?.throwIfAborted();
-    const observation = await observeRecoveryFunding(document, network, chosen, api, options);
+    const observation = await observeSelected(document, network, chosen, api, options);
     require(observation.refundMatureAtObservedTip && observation.rawFundingTransactionHex === record.rawFundingTransactionHex);
     options.assertCurrent(); options.signal?.throwIfAborted();
     journal = await BrowserRefundJournal.open();

@@ -1,8 +1,9 @@
 /** Explicit local recovery import and separately approved refund actions. Never uploads keys or imports. */
 import { MAX_RECOVERY_CIPHERTEXT_BYTES } from "./recoveryAgeContainer";
 import { decryptRecoveryContainer } from "./recoveryKeys";
-import { inspectRecoveryPlaintext, type RecoveryInspection } from "./recoveryInspection";
-import { observeRecoveryFunding, RecoveryFundingSpentError } from "./recoveryFunding";
+import { inspectRecoveryPlaintext, type RecoveryInspection, type RecoveryRefundSelection } from "./recoveryInspection";
+import { observeRecoveryFunding, observeRecoveryOutpoint, RecoveryFundingSpentError } from "./recoveryFunding";
+import { discoverRecoveryDeposits, type RecoveryDepositCandidate } from "./recoveryDiscovery";
 import { reverseRecoveryControls } from "./reverseRecoveryUi";
 import { evmRecoveryControls } from "./erc20Ui";
 import { identityToRecipient } from "age-encryption";
@@ -89,6 +90,14 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
   result.setAttribute("aria-live", "polite");
   const fundingControls = element("section", "", "swap-recovery-funding-controls");
   fundingControls.hidden = true;
+  const txidLabel = element("label", "Deposit transaction ID (optional)");
+  const txid = element("input", "", "swap-recovery-deposit-txid"); txid.type = "text"; txid.maxLength = 64; txid.spellcheck = false; txid.autocomplete = "off";
+  txidLabel.htmlFor = txid.id;
+  const discover = element("button", "Find deposits", "swap-recovery-find-deposits"); discover.type = "button";
+  const discoveryResult = element("section", "", "swap-recovery-discovery-result"); discoveryResult.setAttribute("aria-live", "polite");
+  fundingControls.append(element("h3", "Find your escrow deposit"), element("p",
+    "Your original terms backup can recover deposits without the provider or a recorded funding revision. Find deposits queries your selected chain API with the public escrow address, or only the transaction ID entered below. Your file and keys stay here."),
+    txidLabel, txid, discover, discoveryResult);
   const revisionLabel = element("label", "Recorded funding revision");
   const revision = element("select", "", "swap-recovery-revision");
   revisionLabel.htmlFor = revision.id;
@@ -115,6 +124,7 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
   const refundResult = element("section", "", "swap-refund-result"); refundResult.setAttribute("aria-live", "polite");
   refundControls.append(element("h3", "Refund to the signed destination"), destination, feeLabel, fee, amount,
     element("p", "An imported file cannot prove ownership of this address. Verify it in your wallet before approving. The signed destination cannot be changed."),
+    element("p", "After the timeout, a refund can still race a provider claim if the provider learned the payment preimage. Check your Lightning wallet; an API observation cannot eliminate that race."),
     consent, prepare, download, broadcast, refundResult);
   fundingControls.append(refundControls);
   details.append(olderKey, inspect, result, fundingControls);
@@ -123,26 +133,37 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
   let inspected: RecoveryInspection | undefined;
   let pendingInvalidated = false;
   let prepared: RefundJournalRecord | undefined;
+  let candidates: readonly RecoveryDepositCandidate[] = [];
   const invalidateRefund = (): void => { prepared = undefined; download.hidden = broadcast.hidden = true; refundResult.replaceChildren(); };
+  const candidateKey = (candidate: RecoveryDepositCandidate): string => `outpoint:${candidate.fundingTxid}:${candidate.fundingVout}`;
+  const selectedFunding = (): { selection: RecoveryRefundSelection; valueSat: string } | undefined => {
+    const candidate = candidates.find((item) => candidateKey(item) === revision.value);
+    if (candidate) return { selection: { kind: "outpoint", fundingTxid: candidate.fundingTxid, fundingVout: candidate.fundingVout }, valueSat: candidate.valueSat };
+    const binding = inspected?.fundingHistory.find((item) => String(item.binding_revision) === revision.value);
+    return binding ? { selection: { fundingAttemptId: binding.funding_attempt_id, bindingRevision: binding.binding_revision }, valueSat: binding.contract_value_sat } : undefined;
+  };
+  const recordedOptions = () => inspected!.fundingHistory.map((binding) => Object.assign(element("option",
+    `Revision ${binding.binding_revision} · ${binding.funding_txid.slice(0, 12)}...`), { value: String(binding.binding_revision) }));
 
   const clear = (): void => {
     disposeReverse?.(); disposeReverse = undefined;
     pendingInvalidated = true; invalidateRefund();
-    if (!busy) { result.replaceChildren(); fundingResult.replaceChildren(); fundingControls.hidden = true; inspected = undefined; }
+    if (!busy) { result.replaceChildren(); fundingResult.replaceChildren(); discoveryResult.replaceChildren(); candidates = []; fundingControls.hidden = true; inspected = undefined; }
   };
   file.onchange = keyFile.onchange = clear;
   words.oninput = clear;
   const show = (report: RecoveryInspection): void => {
     inspected = report;
+    candidates = []; txid.value = ""; discoveryResult.replaceChildren();
     invalidateRefund();
     destination.textContent = `Refund address: ${scriptAddress(report.destinationScript, report.networkName)}`;
     fee.max = report.maxRefundFeeSat;
     fee.value = (BigInt(report.maxRefundFeeSat) < 300n ? BigInt(report.maxRefundFeeSat) : 300n).toString();
-    revision.replaceChildren(...report.fundingHistory.map((binding) => Object.assign(element("option",
-      `Revision ${binding.binding_revision} · ${binding.funding_txid.slice(0, 12)}...`), { value: String(binding.binding_revision) })));
+    revision.replaceChildren(...recordedOptions());
     revision.value = String(report.fundingHistory.at(-1)?.binding_revision ?? "");
+    revisionLabel.textContent = "Recorded funding revision";
     revisionLabel.hidden = revision.hidden = report.fundingHistory.length <= 1;
-    fundingControls.hidden = report.fundingHistory.length === 0;
+    fundingControls.hidden = false;
     fundingResult.replaceChildren();
     result.replaceChildren(element("h3", "Recovery record verified"),
       element("p", `${report.networkName} · BTC to Lightning · ${report.recordedBindingCount} recorded funding revision${report.recordedBindingCount === 1 ? "" : "s"}.`),
@@ -202,30 +223,76 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
         plaintext?.fill(0);
         busy = false;
         file.disabled = keyFile.disabled = words.disabled = inspect.disabled = false;
+        if (inspected) updateAmount();
       }
     })();
   };
   const updateAmount = (): void => {
-    const binding = inspected?.fundingHistory.find((item) => String(item.binding_revision) === revision.value);
-    amount.textContent = binding && /^(0|[1-9][0-9]{0,15})$/.test(fee.value) ?
-      `Refund amount: ${(BigInt(binding.contract_value_sat) - BigInt(fee.value)).toString()} sat, minus no further provider fee. Signed fee cap: ${inspected!.maxRefundFeeSat} sat.` : "Choose a valid total fee.";
+    const funding = selectedFunding();
+    check.disabled = prepare.disabled = busy || !funding;
+    amount.textContent = funding && /^(0|[1-9][0-9]{0,15})$/.test(fee.value) ?
+      `Refund amount: ${(BigInt(funding.valueSat) - BigInt(fee.value)).toString()} sat, minus no further provider fee. Signed fee cap: ${inspected!.maxRefundFeeSat} sat. Selected output value: ${funding.valueSat} sat.` :
+      funding ? "Choose a valid total fee." : "Find and explicitly select a deposit output before approving a refund.";
   };
   revision.onchange = () => { pendingInvalidated = true; fundingResult.replaceChildren(); invalidateRefund(); updateAmount(); };
   fee.oninput = () => { pendingInvalidated = true; invalidateRefund(); updateAmount(); };
+  txid.oninput = () => { pendingInvalidated = true; invalidateRefund(); };
+  discover.onclick = () => {
+    if (busy || !inspected) return;
+    const selectedFile = file.files?.[0], selectedKey = keyFile.files?.[0], selectedWords = words.value, transactionId = txid.value.trim().toLowerCase();
+    if (!selectedFile || (transactionId && !/^[0-9a-f]{64}$/.test(transactionId))) {
+      discoveryResult.replaceChildren(element("p", "Enter a 64-character transaction ID, or leave it empty to search the escrow address.")); return;
+    }
+    const selected = options.selectedNetwork(), network = structuredClone(selected.identity) as { name: NetworkName; genesis_hash: string };
+    let api: string;
+    try { api = options.selectedChainApi(); } catch { discoveryResult.replaceChildren(element("p", "Check the chain API in Settings. No connection was made.")); return; }
+    busy = true; pendingInvalidated = false; invalidateRefund();
+    file.disabled = keyFile.disabled = words.disabled = inspect.disabled = discover.disabled = txid.disabled = revision.disabled = check.disabled = fee.disabled = prepare.disabled = true;
+    discoveryResult.replaceChildren(element("p", "Looking for deposits with your selected API..."));
+    void (async () => {
+      let plaintext: Uint8Array | undefined;
+      try {
+        const identity = await readIdentity(selectedKey, selectedWords);
+        plaintext = await decryptRecoveryContainer(new Uint8Array(await selectedFile.arrayBuffer()), identity);
+        const discovery = await discoverRecoveryDeposits(plaintext, network, api, transactionId ? { transactionId } : {});
+        if (pendingInvalidated || options.selectedNetwork().name !== selected.name || options.selectedChainApi() !== api ||
+          file.files?.[0] !== selectedFile || keyFile.files?.[0] !== selectedKey || words.value !== selectedWords || txid.value.trim().toLowerCase() !== transactionId) throw new Error("Selection changed");
+        candidates = discovery.candidates;
+        revision.replaceChildren(Object.assign(element("option", "Choose an output to check and recover"), { value: "" }), ...recordedOptions(),
+          ...candidates.map((candidate) => Object.assign(element("option",
+            `${candidate.fundingTxid}:${candidate.fundingVout} · ${candidate.valueSat} sat${candidate.matchesQuotedAmount ? "" : " (differs from quoted amount)"}`), { value: candidateKey(candidate) })));
+        revision.value = ""; revisionLabel.textContent = "Select funding output"; revisionLabel.hidden = revision.hidden = false;
+        fundingResult.replaceChildren();
+        discoveryResult.replaceChildren(element("p", `Found ${candidates.length} matching output${candidates.length === 1 ? "" : "s"}. Select each output separately; nothing is selected automatically.`),
+          element("p", candidates.length ? "Candidates are not proof of confirmed or unspent funds. Check the selected output before approving its refund." :
+            "No matching deposit was found by this lookup. This is not proof that no deposit exists. Enter its transaction ID or try another chain API."),
+          element("p", transactionId ? "Only the supplied transaction was checked, not the address history." : discovery.historyComplete ?
+            "The API reported the end of its address history. This is not an independent or birthday-based full-chain scan." :
+            "The bounded address search is incomplete or pagination is unavailable. Use a transaction ID for deposits not listed."),
+          element("p", "Nothing was signed or broadcast."));
+      } catch {
+        discoveryResult.replaceChildren(element("p", "Deposit discovery unavailable. Check the file, key, network and chain API, or enter the deposit transaction ID. Keep your original backup. Nothing was signed or broadcast."));
+      } finally {
+        plaintext?.fill(0); busy = false;
+        file.disabled = keyFile.disabled = words.disabled = inspect.disabled = discover.disabled = txid.disabled = revision.disabled = fee.disabled = false;
+        updateAmount();
+      }
+    })();
+  };
   check.onclick = () => {
     if (busy || !inspected) return;
     const selectedFile = file.files?.[0], selectedKey = keyFile.files?.[0], selectedWords = words.value;
     const selected = options.selectedNetwork(), expectedNetwork = structuredClone(selected.identity);
     const selectedRevision = revision.value;
-    const binding = inspected.fundingHistory.find((item) => String(item.binding_revision) === selectedRevision);
-    if (!selectedFile || !binding || selectedFile.size === 0 || selectedFile.size > MAX_RECOVERY_CIPHERTEXT_BYTES ||
+    const funding = selectedFunding();
+    if (!selectedFile || !funding || selectedFile.size === 0 || selectedFile.size > MAX_RECOVERY_CIPHERTEXT_BYTES ||
       (selectedKey && (selectedKey.size === 0 || selectedKey.size > 4096))) return;
     let api: string;
     try { api = options.selectedChainApi(); }
     catch { fundingResult.replaceChildren(element("p", "Check the chain API in Settings. No connection was made.")); return; }
     busy = true;
     pendingInvalidated = false;
-    file.disabled = keyFile.disabled = words.disabled = inspect.disabled = check.disabled = revision.disabled = true;
+    file.disabled = keyFile.disabled = words.disabled = inspect.disabled = check.disabled = revision.disabled = discover.disabled = txid.disabled = true;
     fundingResult.replaceChildren(element("p", "Checking funding with your selected API..."));
     void (async () => {
       let plaintext: Uint8Array | undefined;
@@ -233,8 +300,9 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
         const identity = await readIdentity(selectedKey, selectedWords);
         plaintext = await decryptRecoveryContainer(new Uint8Array(await selectedFile.arrayBuffer()), identity);
         const observedAt = Date.now();
-        const observation = await observeRecoveryFunding(plaintext, expectedNetwork as { name: NetworkName; genesis_hash: string },
-          { fundingAttemptId: binding.funding_attempt_id, bindingRevision: binding.binding_revision }, api);
+        const network = expectedNetwork as { name: NetworkName; genesis_hash: string };
+        const observation = "kind" in funding.selection ? await observeRecoveryOutpoint(plaintext, network, funding.selection, api) :
+          await observeRecoveryFunding(plaintext, network, funding.selection, api);
         if (pendingInvalidated || options.selectedNetwork().name !== selected.name || options.selectedChainApi() !== api || revision.value !== selectedRevision ||
           file.files?.[0] !== selectedFile || keyFile.files?.[0] !== selectedKey || words.value !== selectedWords) throw new Error("Selection changed");
         fundingResult.replaceChildren(element("h3", "Funding observed by your API"),
@@ -252,7 +320,7 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
           : "Funding could not be verified for the current selection. Check the file, key, network, API, and revision, then try again. Nothing was signed or broadcast."));
       } finally {
         plaintext?.fill(0); busy = false;
-        file.disabled = keyFile.disabled = words.disabled = inspect.disabled = check.disabled = revision.disabled = false;
+        file.disabled = keyFile.disabled = words.disabled = inspect.disabled = revision.disabled = discover.disabled = txid.disabled = false; updateAmount();
       }
     })();
   };
@@ -260,15 +328,15 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
     if (busy || !inspected || (action !== "prepare" && !prepared)) return;
     const selectedFile = file.files?.[0], selectedKey = keyFile.files?.[0], selectedWords = words.value, selectedRevision = revision.value, feeText = fee.value;
     const selected = options.selectedNetwork(), network = structuredClone(selected.identity) as { name: NetworkName; genesis_hash: string };
-    const binding = inspected.fundingHistory.find((item) => String(item.binding_revision) === selectedRevision);
-    if (!selectedFile || !binding || selectedFile.size === 0 || selectedFile.size > MAX_RECOVERY_CIPHERTEXT_BYTES ||
+    const funding = selectedFunding();
+    if (!selectedFile || !funding || selectedFile.size === 0 || selectedFile.size > MAX_RECOVERY_CIPHERTEXT_BYTES ||
       (selectedKey && (selectedKey.size === 0 || selectedKey.size > 4096)) || !/^(0|[1-9][0-9]{0,15})$/.test(feeText)) return;
     let api: string, broadcastApi: string;
     try { api = options.selectedChainApi(); broadcastApi = options.selectedBroadcastApi(); }
     catch { refundResult.replaceChildren(element("p", "Check your API settings before approving a refund.")); return; }
     const saved = prepared;
     pendingInvalidated = false; busy = true;
-    file.disabled = keyFile.disabled = words.disabled = inspect.disabled = check.disabled = revision.disabled = fee.disabled = prepare.disabled = download.disabled = broadcast.disabled = true;
+    file.disabled = keyFile.disabled = words.disabled = inspect.disabled = check.disabled = revision.disabled = fee.disabled = prepare.disabled = download.disabled = broadcast.disabled = discover.disabled = txid.disabled = true;
     refundResult.replaceChildren(element("p", action === "prepare" ? "Checking funding and preparing your approved refund..." : "Rechecking the approved refund..."));
     const assertCurrent = (): void => {
       if (pendingInvalidated || file.files?.[0] !== selectedFile || keyFile.files?.[0] !== selectedKey || words.value !== selectedWords || revision.value !== selectedRevision || fee.value !== feeText ||
@@ -280,7 +348,7 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
         const identity = await readIdentity(selectedKey, selectedWords);
         plaintext = await decryptRecoveryContainer(new Uint8Array(await selectedFile.arrayBuffer()), identity);
         assertCurrent();
-        const selection = { fundingAttemptId: binding.funding_attempt_id, bindingRevision: binding.binding_revision };
+        const selection = funding.selection;
         const approved = { assertCurrent, broadcastApi };
         if (action === "prepare") {
           const record = await prepareBrowserRefund(plaintext, network, selection, api, BigInt(feeText), approved);
@@ -310,7 +378,7 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
         refundResult.replaceChildren(element("p", "Refund action could not be completed. No automatic retry or replacement will occur. A saved intent may be prepared, unknown, or accepted; approve and load it again to inspect its state."));
       } finally {
         plaintext?.fill(0); busy = false;
-        file.disabled = keyFile.disabled = words.disabled = inspect.disabled = check.disabled = revision.disabled = fee.disabled = prepare.disabled = download.disabled = broadcast.disabled = false;
+        file.disabled = keyFile.disabled = words.disabled = inspect.disabled = revision.disabled = fee.disabled = download.disabled = broadcast.disabled = discover.disabled = txid.disabled = false; updateAmount();
       }
     })();
   };

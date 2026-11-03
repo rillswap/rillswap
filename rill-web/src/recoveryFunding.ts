@@ -1,7 +1,7 @@
 /** Explicit, trusted-API funding observations. No signing, storage, retries, or broadcast. */
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { MAX_RECOVERY_PLAINTEXT_BYTES } from "./recoveryAgeContainer";
-import { checkSelectedRecoveryFundingTransaction, checkSelectedReverseFundingTransaction, inspectRecoveryPlaintext, inspectReverseRecoveryPlaintext, isSupportedRecoveryNetwork, type RecoveryFundingSelection } from "./recoveryInspection";
+import { checkRecoveryOutpointTransaction, checkSelectedRecoveryFundingTransaction, checkSelectedReverseFundingTransaction, inspectRecoveryPlaintext, inspectReverseRecoveryPlaintext, isSupportedRecoveryNetwork, type RecoveryFundingSelection, type RecoveryOutpointSelection, type RecoveryRefundSelection } from "./recoveryInspection";
 import { parseStrictEventJson } from "./strictEventJson";
 import { readBoundedChainText, readChainTip, type ChainFetch } from "./swap/chainTip";
 import { validateMempoolApi, type NetworkName } from "./swap/config";
@@ -84,7 +84,19 @@ export async function observeRecoveryFunding(
   base: string,
   options: { readonly signal?: AbortSignal; readonly fetch?: ChainFetch } = {},
 ): Promise<RecoveryFundingObservation> {
-  return observeFunding(plaintext, independentlySelectedNetwork, selection, base, options, "btc-to-ln/v1");
+  return observeFunding(plaintext, independentlySelectedNetwork,
+    { fundingAttemptId: selection.fundingAttemptId, bindingRevision: selection.bindingRevision }, base, options, "btc-to-ln/v1");
+}
+
+/** Explicit actual-output observation, without a recorded or synthesized binding. */
+export async function observeRecoveryOutpoint(
+  plaintext: Uint8Array,
+  independentlySelectedNetwork: { readonly name: NetworkName; readonly genesis_hash: string },
+  selection: RecoveryOutpointSelection, base: string,
+  options: { readonly signal?: AbortSignal; readonly fetch?: ChainFetch } = {},
+): Promise<RecoveryFundingObservation> {
+  return observeFunding(plaintext, independentlySelectedNetwork,
+    { kind: selection.kind, fundingTxid: selection.fundingTxid, fundingVout: selection.fundingVout }, base, options, "btc-to-ln/v1");
 }
 
 /**
@@ -98,11 +110,12 @@ export async function observeReverseRecoveryFunding(
   selection: RecoveryFundingSelection, base: string,
   options: { readonly signal?: AbortSignal; readonly fetch?: ChainFetch; readonly allowUnconfirmed?: boolean } = {},
 ): Promise<RecoveryFundingObservation> {
-  return observeFunding(plaintext, independentlySelectedNetwork, selection, base, options, "ln-to-btc/v1", options.allowUnconfirmed === true);
+  return observeFunding(plaintext, independentlySelectedNetwork,
+    { fundingAttemptId: selection.fundingAttemptId, bindingRevision: selection.bindingRevision }, base, options, "ln-to-btc/v1", options.allowUnconfirmed === true);
 }
 
 async function observeFunding(plaintext: Uint8Array,
-  independentlySelectedNetwork: { readonly name: NetworkName; readonly genesis_hash: string }, selection: RecoveryFundingSelection, base: string,
+  independentlySelectedNetwork: { readonly name: NetworkName; readonly genesis_hash: string }, selection: RecoveryRefundSelection, base: string,
   options: { readonly signal?: AbortSignal; readonly fetch?: ChainFetch }, profile: "btc-to-ln/v1" | "ln-to-btc/v1",
   allowUnconfirmed = false,
 ): Promise<RecoveryFundingObservation> {
@@ -112,14 +125,25 @@ async function observeFunding(plaintext: Uint8Array,
     snapshot = Uint8Array.from(plaintext);
     const network = structuredClone(independentlySelectedNetwork);
     require(isSupportedRecoveryNetwork(network));
-    const chosen = { fundingAttemptId: selection.fundingAttemptId, bindingRevision: selection.bindingRevision };
-    require(typeof chosen.fundingAttemptId === "string" && HEX32.test(chosen.fundingAttemptId));
-    require(Number.isSafeInteger(chosen.bindingRevision) && chosen.bindingRevision >= 0 && chosen.bindingRevision < 64);
+    const chosen = { ...selection };
     const api = validateMempoolApi(base, network.name);
     const report = profile === "ln-to-btc/v1" ? inspectReverseRecoveryPlaintext(snapshot, network) : inspectRecoveryPlaintext(snapshot, network);
-    const matches = report.fundingHistory.filter((binding) => binding.funding_attempt_id === chosen.fundingAttemptId && binding.binding_revision === chosen.bindingRevision);
-    require(matches.length === 1);
-    const binding = matches[0]!;
+    let fundingTxid: string, fundingVout: number;
+    let checkRaw: (raw: Uint8Array) => void;
+    if ("kind" in chosen) {
+      require(profile === "btc-to-ln/v1" && chosen.kind === "outpoint");
+      require(typeof chosen.fundingTxid === "string" && HEX32.test(chosen.fundingTxid));
+      require(Number.isSafeInteger(chosen.fundingVout) && chosen.fundingVout >= 0 && chosen.fundingVout <= 0xffffffff);
+      fundingTxid = chosen.fundingTxid; fundingVout = chosen.fundingVout;
+      checkRaw = (raw) => checkRecoveryOutpointTransaction(snapshot!, network, chosen, raw);
+    } else {
+      require(typeof chosen.fundingAttemptId === "string" && HEX32.test(chosen.fundingAttemptId));
+      require(Number.isSafeInteger(chosen.bindingRevision) && chosen.bindingRevision >= 0 && chosen.bindingRevision < 64);
+      const matches = report.fundingHistory.filter((binding) => binding.funding_attempt_id === chosen.fundingAttemptId && binding.binding_revision === chosen.bindingRevision);
+      require(matches.length === 1);
+      fundingTxid = matches[0]!.funding_txid; fundingVout = matches[0]!.contract_vout;
+      checkRaw = (raw) => (profile === "ln-to-btc/v1" ? checkSelectedReverseFundingTransaction : checkSelectedRecoveryFundingTransaction)(snapshot!, network, chosen, raw);
+    }
     const transport = options.fetch ?? fetch;
     const signal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000);
     signal.throwIfAborted();
@@ -131,13 +155,13 @@ async function observeFunding(plaintext: Uint8Array,
     let inclusion: { height: number; hash: string } | null | undefined;
     let rawHex: string | undefined;
     for (let pass = 0; pass < 2; pass++) {
-      const text = await get(`tx/${binding.funding_txid}/hex`, MAX_TRANSACTION_BYTES * 2);
+      const text = await get(`tx/${fundingTxid}/hex`, MAX_TRANSACTION_BYTES * 2);
       require(/^(?:[0-9a-f]{2})+$/.test(text));
       if (rawHex !== undefined) require(text === rawHex);
       // Establish actual output existence BEFORE interpreting any outspend flag.
-      (profile === "ln-to-btc/v1" ? checkSelectedReverseFundingTransaction : checkSelectedRecoveryFundingTransaction)(snapshot, network, chosen, hexToBytes(text));
+      checkRaw(hexToBytes(text));
       rawHex = text;
-      const status = jsonObject(await get(`tx/${binding.funding_txid}/status`));
+      const status = jsonObject(await get(`tx/${fundingTxid}/status`));
       if (allowUnconfirmed && status.confirmed === false) {
         require(inclusion === undefined || inclusion === null);
         inclusion = null;
@@ -151,7 +175,7 @@ async function observeFunding(plaintext: Uint8Array,
         if (inclusion !== undefined) require(inclusion !== null && inclusion.height === height && inclusion.hash === hash);
         inclusion = { height, hash };
       }
-      const outspend = await readOutspend(get, binding.funding_txid, binding.contract_vout);
+      const outspend = await readOutspend(get, fundingTxid, fundingVout);
       spent = outspend.spent === true;
       require(outspend.spent === false);
     }
@@ -160,7 +184,7 @@ async function observeFunding(plaintext: Uint8Array,
     signal.throwIfAborted();
     return Object.freeze({ observation: "trusted-api", networkName: network.name,
       rawFundingTransactionHex: rawHex!,
-      fundingTxid: binding.funding_txid, fundingVout: binding.contract_vout,
+      fundingTxid, fundingVout,
       fundingBlockHeight: inclusion?.height ?? null, fundingBlockHash: inclusion?.hash ?? null,
       confirmations: inclusion ? tip.height - inclusion.height + 1 : 0, tipHeight: tip.height, tipHash: tip.hash,
       refundLockHeight: report.refundLockHeight, refundMatureAtObservedTip: tip.height > report.refundLockHeight });
