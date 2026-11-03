@@ -8,10 +8,11 @@ import { swapLinkFragment } from "../src/swapLink";
 import type { RecoveryRefundCase } from "../unit/fixtures/recoveryRefundCases";
 import type { BrowserRefundJournal } from "../src/browserRefundJournal";
 import { testInvoice } from "../../rill-payments/tests/helpers";
-import { hexToBytes } from "@noble/hashes/utils.js";
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { parseRecoveryFundingTransaction, parseTransaction } from "../src/swap/transaction";
 
-declare global { interface Window { uiRefundJournal: typeof BrowserRefundJournal; refundExposurePending: boolean; releaseRefundExposure: () => void } }
+declare global { interface Window { uiRefundJournal: typeof BrowserRefundJournal; refundExposurePending: boolean; releaseRefundExposure: () => void; restoreTermsStorage: () => void } }
 
 const BASE = "http://127.0.0.1:8091/api";
 const corpus = (): RecoveryRefundCase[] => JSON.parse(readFileSync(new URL("../tmp/preview/test-only/recovery-refund-cases.json", import.meta.url), "utf8"));
@@ -91,16 +92,18 @@ for (const failStorage of [false, true]) test(`funded callback ${failStorage ? "
     try { return (await wallet.recoveryKey()).recipient; } finally { wallet.close(); }
   });
   const encrypted = await encryptCanonicalRecoveryForRecipient(new TextEncoder().encode(canonicalize(item.record)!), recipient);
-  await page.evaluate(({ bytes, failStorage }) => {
+  const checkpointId = `funded:regtest:${bytesToHex(sha256(encrypted))}`;
+  await page.evaluate(({ bytes, failStorage, checkpointId }) => {
     window.uiFixture.fundedRecovery = bytes;
     if (failStorage) {
       const original = IDBObjectStore.prototype.add;
       IDBObjectStore.prototype.add = function(this: IDBObjectStore, ...args: Parameters<typeof original>) {
-        if (typeof args[1] === "string" && args[1].startsWith("funded:")) throw new DOMException("quota", "QuotaExceededError");
+        // Refuse this funded checkpoint, not the earlier independent terms checkpoint.
+        if (args[1] === checkpointId) throw new DOMException("quota", "QuotaExceededError");
         return original.apply(this, args);
       };
     }
-  }, { bytes: Array.from(encrypted), failStorage });
+  }, { bytes: Array.from(encrypted), failStorage, checkpointId });
   const now = Math.floor(Date.now() / 1000);
   await page.locator("#swap-invoice").fill(testInvoice("funded_storage", "1000000", now, now + 7200));
   await page.locator("#swap-start").click();
@@ -117,11 +120,82 @@ for (const failStorage of [false, true]) test(`funded callback ${failStorage ? "
   const before = calls.length;
   await page.goto("about:blank"); await page.goto(url); // No URL fragment or download is used.
   await openTool(page, "history");
-  await page.getByRole("button", { name: "Open saved swap", exact: true }).click();
+  await page.locator(".saved-swap").filter({ hasText: checkpointId.slice(-16) }).getByRole("button", { name: "Open saved swap", exact: true }).click();
   await expect(page.locator("#swap-recovery-result h3")).toHaveText("Recovery record verified");
-  await expect(page.locator("#swap-status")).toHaveText("Saved funded recovery opened locally");
+  await expect(page.locator("#swap-status")).toHaveText("Saved recovery opened locally");
   expect(calls).toHaveLength(before); expect(sockets).toEqual([]);
 });
+
+test("terms checkpoints survive URL-less reload, open without uploads, and reuse one wallet for multiple swaps", async ({ page }) => {
+  const url = "http://127.0.0.1:18765/test-only/swap.html", item = corpus()[0]!, calls = await chainApi(page, item);
+  const sockets: string[] = []; page.on("websocket", (socket) => sockets.push(socket.url()));
+  await page.goto(url);
+  const identity = await page.evaluate(async () => { const wallet = await window.uiFixture.wallet.open(); try { return wallet.info(); } finally { wallet.close(); } });
+  const checkpointIds: string[] = [];
+  for (const [index, name] of ["P2WPKH refund", "P2TR refund"].entries()) {
+    const record = corpus().find((c) => c.name === name)!; record.record.funding_history = [];
+    const encrypted = await encryptCanonicalRecoveryForRecipient(new TextEncoder().encode(canonicalize(record.record)!), identity.recipient);
+    const id = `funded:regtest:${bytesToHex(sha256(encrypted))}`; checkpointIds.push(id);
+    await page.evaluate(({ bytes, script }) => { window.uiFixture.termsRecovery = bytes; window.uiFixture.fundingScript = script; },
+      { bytes: Array.from(encrypted), script: record.record.taproot_contract.script_pubkey });
+    const now = Math.floor(Date.now() / 1000);
+    await page.locator("#swap-invoice").fill(testInvoice(`terms_storage_${index}`, "1000000", now, now + 7200));
+    await page.locator("#swap-start").click(); await page.locator("#swap-quote-accept").click();
+    await expect(page.locator("#swap-funding-uri")).toBeVisible();
+    expect(await page.evaluate(async (id) => { const wallet = await window.uiFixture.wallet.open(); try { return (await wallet.listFundedRecoveries()).some((entry) => entry.id === id); } finally { wallet.close(); } }, id)).toBe(true);
+    await page.goto("about:blank"); await page.goto(url); // No bookmarked link, key import or recovery-file input.
+  }
+  const state = await page.evaluate(async () => { const wallet = await window.uiFixture.wallet.open(); try { return { info: await wallet.info(), nextIndex: (await wallet.allocateRefund("regtest")).index }; } finally { wallet.close(); } });
+  expect(state.info.fingerprint).toBe(identity.fingerprint); expect(state.info.recipient).toBe(identity.recipient); expect(state.nextIndex).toBe(2);
+  const before = calls.length;
+  await openRecovery(page); await page.locator("#swap-open-saved-recoveries").click();
+  await expect(page.locator("#swap-saved-recoveries")).toBeVisible(); await expect(page.locator(".saved-swap")).toHaveCount(2);
+  for (const id of checkpointIds) {
+    await page.locator(".saved-swap").filter({ hasText: id.slice(-16) }).getByRole("button", { name: "Open saved swap", exact: true }).click();
+    await expect(page.locator("#swap-recovery-result h3")).toHaveText("Recovery record verified");
+    await expect(page.locator("#swap-recovery-result")).toContainText("0 recorded funding revisions");
+    await expect(page.locator("#swap-status")).toHaveText("Saved recovery opened locally");
+    expect(new URL(page.url()).hash).toBe("");
+    await page.locator("#swap-open-saved-recoveries").click();
+  }
+  expect(calls).toHaveLength(before); expect(sockets).toEqual([]);
+});
+
+for (const failure of ["quota", "readback"]) {
+  test(`terms ${failure} failure refuses the deposit address, retains backup, and never resets the wallet`, async ({ page }) => {
+    const item = corpus()[0]!; item.record.funding_history = []; await chainApi(page, item);
+    await page.goto("http://127.0.0.1:18765/test-only/swap.html");
+    const identity = await page.evaluate(async () => { const wallet = await window.uiFixture.wallet.open(); try { return wallet.info(); } finally { wallet.close(); } });
+    const encrypted = await encryptCanonicalRecoveryForRecipient(new TextEncoder().encode(canonicalize(item.record)!), identity.recipient);
+    const id = `funded:regtest:${bytesToHex(sha256(encrypted))}`;
+    await page.evaluate(({ bytes, script, id, failure }) => {
+      window.uiFixture.termsRecovery = bytes; window.uiFixture.fundingScript = script;
+      const add = IDBObjectStore.prototype.add, get = IDBObjectStore.prototype.get;
+      window.restoreTermsStorage = () => { IDBObjectStore.prototype.add = add; IDBObjectStore.prototype.get = get; };
+      IDBObjectStore.prototype.add = function (...args: Parameters<IDBObjectStore["add"]>) {
+        if (failure === "quota" && args[1] === id) throw new DOMException("quota", "QuotaExceededError");
+        return add.apply(this, args);
+      };
+      IDBObjectStore.prototype.get = function (...args: Parameters<IDBObjectStore["get"]>) {
+        if (failure === "readback" && args[0] === id && this.transaction.mode === "readonly") throw new Error("synthetic interrupted readback");
+        return get.apply(this, args);
+      };
+    }, { bytes: Array.from(encrypted), script: item.record.taproot_contract.script_pubkey, id, failure });
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      await page.locator("#swap-invoice").fill(testInvoice(`terms_${failure}`, "1000000", now, now + 7200));
+      await page.locator("#swap-start").click(); await page.locator("#swap-quote-accept").click();
+      await expect(page.locator("#swap-error")).toContainText("Browser recovery storage");
+      await expect(page.locator("#swap-funding-uri")).toHaveCount(0);
+      expect(await page.evaluate(() => !!window.uiFixture.fundingPublished || !!window.uiFixture.fundingSource)).toBe(false);
+      await page.locator("#swap-backups summary").click(); await expect(page.locator('#swap-backups a[download*="terms-recovery"]')).toBeVisible();
+      expect(new URL(page.url()).hash).toBe(swapLinkFragment({ file: encrypted, network: "regtest" }));
+    } finally { await page.evaluate(() => window.restoreTermsStorage()); }
+    const state = await page.evaluate(async () => { const wallet = await window.uiFixture.wallet.open(); try { return { info: await wallet.info(), nextIndex: (await wallet.allocateRefund("regtest")).index, saved: (await wallet.listFundedRecoveries()).length }; } finally { wallet.close(); } });
+    expect(state.info.fingerprint).toBe(identity.fingerprint); expect(state.nextIndex).toBe(1);
+    expect(state.saved).toBe(failure === "quota" ? 0 : 1);
+  });
+}
 
 test("opening a saved checkpoint clears a different linked record's URL authority", async ({ page }) => {
   const item = corpus()[0]!, calls = await chainApi(page, item);
@@ -143,7 +217,7 @@ test("opening a saved checkpoint clears a different linked record's URL authorit
   await expect(page.locator("#swap-link")).toBeVisible();
   await openTool(page, "history");
   await page.getByRole("button", { name: "Open saved swap", exact: true }).click();
-  await expect(page.locator("#swap-status")).toHaveText("Saved funded recovery opened locally");
+  await expect(page.locator("#swap-status")).toHaveText("Saved recovery opened locally");
   await expect(page.locator("#swap-link")).toBeHidden();
   expect(new URL(page.url()).hash).toBe("");
   const bytes = await page.locator("#swap-recovery-file").evaluate(async (input) =>

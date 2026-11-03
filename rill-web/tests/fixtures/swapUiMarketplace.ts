@@ -11,7 +11,7 @@ declare global {
       /** Each prepared execution's claimConfirmations (null: absent, the signed depth). */
       reverseClaimConfirmations?: (number | null)[];
       reverseDiagnosticFeeFailure?: boolean;
-      fundedRecovery?: number[]; fundingPublished?: boolean;
+      termsRecovery?: number[]; fundedRecovery?: number[]; fundingPublished?: boolean;
       wallet: typeof BrowserRecoveryWallet; releaseInfo?: () => void; infoPending: boolean };
     /**
      * Announced base fee for the directory, 0 by default so every fixture quote is above the
@@ -70,7 +70,7 @@ export const quoteProviders = async (_providers: unknown[], request: unknown, _s
       execute: async (hooks: { onActivity?: import("../../src/swap/activity").ActivityObserver; saveRecovery: (file: Uint8Array, stage: string) => Promise<void>; fundingSource: (request: unknown) => Promise<unknown> }) => {
         window.uiFixture.executed++; window.uiFixture.executedProviders.push(id.repeat(64));
         hooks.onActivity?.({ name: "terms.verified", facts: { profile: "btc-to-ln/v1", session_id: id.repeat(64), payment_hash: "ab".repeat(32), memo: "Fixture coffee", amount_msat: "1000000", success_fee_sat: "100" } });
-        await hooks.saveRecovery(new Uint8Array([7, 7, 7]), "terms");
+        await hooks.saveRecovery(Uint8Array.from(window.uiFixture.termsRecovery ?? [7, 7, 7]), "terms");
         hooks.onActivity?.({ name: "recovery.saved", facts: { stage: "terms" } });
         if (window.uiFixture.fundedRecovery) {
           await hooks.saveRecovery(Uint8Array.from(window.uiFixture.fundedRecovery), "funded");

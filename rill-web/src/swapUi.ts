@@ -854,8 +854,14 @@ function mount(root: HTMLElement): void {
   const savedRecoveries = node("details", "", "swap-saved-recoveries");
   savedRecoveries.append(node("summary", "Your swaps"));
   const savedList = node("div", "Loading local recovery checkpoints...", "swap-saved-recoveries-list");
-  savedRecoveries.append(node("p", "Saved on this device. Resume continues an existing swap without paying again."), savedList);
+  savedRecoveries.append(node("p", "Encrypted recovery checkpoints saved in this browser, including terms before a deposit is observed. Open a saved swap without uploading a file. Resume continues an existing swap without paying again."), savedList);
   addUtility(historyButton, savedRecoveries);
+  const openSavedRecoveries = node("button", "Open saved swaps", "swap-open-saved-recoveries"); openSavedRecoveries.type = "button";
+  openSavedRecoveries.onclick = () => {
+    if (busy) return;
+    showUtility(historyButton); savedRecoveries.open = true; void refreshSavedRecoveries();
+  };
+  recoveryTools.prepend(openSavedRecoveries);
   const refreshSavedRecoveries = async (): Promise<void> => {
     try {
       const wallet = await walletPromise, entries = await wallet.listFundedRecoveries();
@@ -875,15 +881,15 @@ function mount(root: HTMLElement): void {
               if (busy) return;
               if (label === "Prepare download") {
                 for (const old of actions.querySelectorAll<HTMLAnchorElement>("a[download]")) { URL.revokeObjectURL(old.href); old.remove(); }
-                offerDownload(actions, snapshot.ciphertext, `rillswap-funded-${entry.id.slice(-16)}.age`);
+                offerDownload(actions, snapshot.ciphertext, `rillswap-recovery-${entry.id.slice(-16)}.age`);
                 actions.querySelector("a")!.textContent = "Download backup";
               } else {
                 if (network.value !== snapshot.network) { network.value = snapshot.network; applyNetwork(); }
                 history.replaceState(null, "", location.pathname + location.search);
                 linkPublished = false; linkAnchor.removeAttribute("href"); linkBox.hidden = true;
-                showTracking("Saved funded swap");
-                setStatus("Saved funded recovery opened locally", -1, "ready");
-                recovery.load(snapshot.ciphertext, "saved-funded-swap.age");
+                showTracking("Saved swap recovery");
+                setStatus("Saved recovery opened locally", -1, "ready");
+                recovery.load(snapshot.ciphertext, "saved-swap.age");
                 showUtility(recoveryButton);
               }
             }).catch((error: Error) => { row.append(node("p", error.message)); })
@@ -1799,7 +1805,7 @@ async function run(
   onActivity: ActivityObserver,
   publish: (file: Uint8Array) => void,
   chainApi: () => string,
-  persistFunded: (file: Uint8Array) => Promise<void>,
+  persistRecovery: (file: Uint8Array) => Promise<void>,
   timing: QuoteTiming,
   recoveryObservation?: ChainObservation,
 ): Promise<boolean> {
@@ -1827,7 +1833,9 @@ async function run(
       saveRecovery: async (file, kind) => {
         updateBackup(file, kind);
         publish(file);
-        if (kind === "funded") await persistFunded(file);
+        // This hook is awaited before the deposit address appears, and again
+        // before funding publication. A download/link alone is not a local checkpoint.
+        if (kind === "terms" || kind === "funded") await persistRecovery(file);
       },
       // Showing the address can commit funds: anything sent there is the user's deposit from that moment.
       fundingSource: (funding) => {

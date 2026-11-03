@@ -19,6 +19,7 @@ export const WALLET_DATABASE = "rillswap-browser-wallet-v1";
 export const WALLET_SCHEME = "bip84-rillswap-v1";
 const STORE = "identity";
 const RECORD = "wallet";
+// Historical namespace for opaque checkpoints, including terms. Never evidence of funding.
 const SNAPSHOT_PREFIX = "funded:";
 const INDEX_LIMIT = 2 ** 31;
 const encoder = new TextEncoder();
@@ -223,7 +224,7 @@ export class BrowserRecoveryWallet {
 
   close(): void { this.db.close(); }
 
-  /** Immutable encrypted checkpoint: strict commit and independent exact readback. */
+  /** Immutable encrypted terms/funded checkpoint: strict commit and independent exact readback. */
   async saveFundedRecovery(network: NetworkName, ciphertext: Uint8Array): Promise<string> {
     const record = snapshotRecord(network, ciphertext);
     const id = snapshotId(record);

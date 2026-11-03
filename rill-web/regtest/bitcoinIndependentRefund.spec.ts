@@ -22,7 +22,7 @@ function inspectTestBackup(keyPath: string, termsPath: string): {
   return JSON.parse(execFileSync("bun", ["-e", script, keyPath, termsPath], { cwd: resolve(root, "rill-web"), encoding: "utf8", timeout: 30000 }));
 }
 
-for (const scenario of ["ordinary deposit", "wallet replacement", "different amount", "duplicate outputs"]) {
+for (const scenario of ["ordinary deposit", "wallet replacement", "different amount", "duplicate outputs", "browser-stored terms"]) {
   test(`original terms-only backup refunds ${scenario} with provider and relays stopped`, async ({ page, browser }, testInfo) => {
     test.skip(!composeEnabled, "Explicit disposable Compose opt-in required");
     test.setTimeout(300000); assertRelayFaultStack();
@@ -30,6 +30,7 @@ for (const scenario of ["ordinary deposit", "wallet replacement", "different amo
     const paymentHash = JSON.parse(command("lncli", "user", "decodepayreq", invoice)).payment_hash;
     command("miner", "pause");
     let confirmed = false;
+    const originalContext = page.context();
     const recoveryContext = await browser.newContext({ acceptDownloads: true });
     const assertOffline = () => {
       const running = compose("ps", "--status", "running", "--services").split("\n");
@@ -82,12 +83,21 @@ for (const scenario of ["ordinary deposit", "wallet replacement", "different amo
       const remaining = record.contract_terms.refund_lock_height + 1 - Number(command("bitcoin-cli", "getblockcount"));
       expect(remaining).toBeLessThan(10000); if (remaining > 0) command("mine", String(remaining));
       assertOffline(); expect(providerState("btc-to-ln", paymentHash)).toBe("ACCEPTED");
-      const recovery = await recoveryContext.newPage(); let posts = 0;
+      const fromStorage = scenario === "browser-stored terms";
+      const recovery = await (fromStorage ? originalContext : recoveryContext).newPage(); let posts = 0;
       recovery.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/api/tx")) posts++; });
       await recovery.goto(webURL()); await openRecovery(recovery);
-      await recovery.locator("#swap-recovery-file").setInputFiles(termsPath);
-      await recovery.locator("#swap-recovery-key-file").setInputFiles(keyPath);
-      await recovery.locator("#swap-recovery-inspect").click();
+      if (fromStorage) {
+        await recovery.locator("#swap-open-saved-recoveries").click();
+        await expect(recovery.locator(".saved-swap")).toHaveCount(1);
+        await recovery.getByRole("button", { name: "Open saved swap", exact: true }).click();
+        // No file selection, mnemonic entry, key import or bookmarked link.
+        expect(new URL(recovery.url()).hash).toBe("");
+      } else {
+        await recovery.locator("#swap-recovery-file").setInputFiles(termsPath);
+        await recovery.locator("#swap-recovery-key-file").setInputFiles(keyPath);
+        await recovery.locator("#swap-recovery-inspect").click();
+      }
       await expect(recovery.locator("#swap-recovery-result")).toContainText("0 recorded funding revisions");
       expect(posts).toBe(0);
       if (scenario === "wallet replacement") await recovery.locator("#swap-recovery-deposit-txid").fill(txid);

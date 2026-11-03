@@ -169,15 +169,20 @@ and can withhold execution. After reload, older recovery files without operation
 proof show a qualified claim observation, not verified sponsored completion.
 Unknown exposure remains blocked from automatic retry.
 
-Funded Bitcoin recovery checkpoints are saved encrypted in browser storage with
-strict commit and exact readback before funding publication. On a URL-less reload,
-open **History** below the swap card. Reverse swaps appear at every saved
+Bitcoin-to-Lightning terms checkpoints are saved encrypted in browser storage
+with strict commit and exact readback before the deposit address is shown. A
+funded checkpoint is saved again before funding publication. On a URL-less reload,
+open **History → Your swaps**, or **Recovery → Open saved swaps**. Reverse swaps appear at every saved
 stage; **Resume** continues funding checks and claims, never a Lightning payment.
-Funded forward swaps open their refund controls locally. Merely listing swaps does
-not connect, pay, sign, or broadcast. Keep a backup independently: browser eviction and
-the interval before an external deposit is observed remain recovery risks.
+Forward checkpoints open recovery locally, including deposit discovery from
+terms-only records. Each saved stage is a separate immutable checkpoint, not
+proof of funding. Merely listing swaps does not connect, pay, sign, or broadcast.
+Keep a backup independently: browser eviction can still remove local records.
 Upgrades preserve existing recovery identities and counters, without retroactive
-checkpoints or automatic network actions. Surviving checkpoints with a missing
+checkpoints, record rewrites, or automatic network actions. Older terms files
+that were never stored still need their download or bookmarked swap link. The
+historical `funded:` storage prefix is unchanged and is not funding authority;
+older builds can still read/download these opaque snapshots. Surviving checkpoints with a missing
 identity cause a safe refusal, never a replacement key.
 
 ## Scripts
@@ -425,6 +430,11 @@ browser storage on restart. **The words alone cannot recover a swap**: the encry
 swap record must also survive, in this browser, a swap link, or the optional latest
 backup download (under Swap backup, or Advanced for Lightning to BTC). The words encrypt records; swap secrets are independently random.
 
+One browser wallet's mnemonic is reused across many swaps. Refund addresses
+use separately reserved, persistent per-network indices; starting another swap
+does not create a new recovery mnemonic. Importing words to decrypt a file does
+not replace that browser's identity or reset its address counters.
+
 Browser recovery keys are not encrypted at rest; same-origin scripts and
 anyone with access to browser storage can read them. Do not clear browser
 storage while funds are pending. The recovery wallet is not a general
@@ -444,6 +454,13 @@ an encrypted recovery container in its URL fragment (never sent to the
 server); treat it like the file. Opening or reloading never retries payments,
 claims or refunds by itself. Resume is explicit and never starts a new cooperative
 nonce attempt.
+
+Encryption and mnemonic derivation have no domain restriction. Browser storage
+does: localhost cannot automatically read a hosted site's saved key or records.
+An encrypted `.age` file alone, even on the correct network, cannot be decrypted
+there. Bring the original site's 12 words or key backup and use **Use a saved
+recovery key**. If inspection fails, the panel distinguishes opening the
+encrypted container from verifying the decrypted record's network and signatures.
 CLI recovery files containing a reverse burn or preimage-disclosure record can
 also be opened. They are authenticated as historical evidence, not signing
 authority; a preexisting signed fallback remains UNKNOWN and export-only.

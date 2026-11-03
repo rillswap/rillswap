@@ -179,17 +179,19 @@ for (const width of [320, 390, 1440]) {
     });
     const item = (JSON.parse(readFileSync(new URL("../tmp/preview/test-only/recovery-refund-cases.json", import.meta.url), "utf8")) as RecoveryRefundCase[])[0]!;
     const encrypted = await encryptCanonicalRecoveryForRecipient(new TextEncoder().encode(canonicalize(item.record)!), recipient);
-    await page.evaluate(async (bytes) => {
+    const checkpointId = await page.evaluate(async (bytes) => {
       const wallet = await window.uiFixture.wallet.open();
-      try { await wallet.saveFundedRecovery("regtest", Uint8Array.from(bytes)); } finally { wallet.close(); }
+      try { return await wallet.saveFundedRecovery("regtest", Uint8Array.from(bytes)); } finally { wallet.close(); }
     }, Array.from(encrypted));
     await page.reload();
     const before = calls.length;
     await openTool(page, "history");
-    await expect(page.locator(".saved-swap h3")).toHaveText("Saved checkpoint");
-    await expect(page.locator(".saved-swap")).not.toContainText("Completed");
+    // The earlier forward terms checkpoint survives alongside this funded fixture.
+    await expect(page.locator(".saved-swap")).toHaveCount(2);
+    await expect(page.locator(".saved-swap h3")).toHaveText(["Saved checkpoint", "Saved checkpoint"]);
+    for (const row of await page.locator(".saved-swap").all()) await expect(row).not.toContainText("Completed");
     await fits(page, info, "history");
-    await page.getByRole("button", { name: "Open saved swap", exact: true }).click();
+    await page.locator(".saved-swap").filter({ hasText: checkpointId.slice(-16) }).getByRole("button", { name: "Open saved swap", exact: true }).click();
     await expect(page.locator("#swap-recovery-result h3")).toHaveText("Recovery record verified");
     await expect(page.locator("#swap-recovery-tools")).toBeVisible();
     await fits(page, info, "recovery");
