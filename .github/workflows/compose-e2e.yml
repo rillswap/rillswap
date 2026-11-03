@@ -65,7 +65,7 @@ jobs:
         working-directory: rill-web
         run: |
           if [ "$RILL_DEV_NETWORK_FEES" = 1 ]; then
-            bunx playwright test --config playwright.regtest.config.ts bitcoin.spec.ts bitcoinFundingRestart.spec.ts reverse.spec.ts dynamicFees.spec.ts
+            bunx playwright test --config playwright.regtest.config.ts bitcoin.spec.ts bitcoinFundingRestart.spec.ts bitcoinIndependentRefund.spec.ts reverse.spec.ts dynamicFees.spec.ts
           else
             bunx playwright test --config playwright.regtest.config.ts --grep-invert 'whole Compose stack'
           fi
