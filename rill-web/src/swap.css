@@ -98,6 +98,21 @@ details.utility-panel > summary { font-size: 1.1rem; font-weight: 650; }
 #swap-recovery-tools #swap-wallet-setup { margin-top: .8rem; }
 #swap-wallet-actions { display: grid; justify-items: start; gap: .75rem; }
 #swap-wallet-actions label { width: 100%; }
+#swap-open-saved-recoveries { margin: .75rem 0 .5rem; }
+#swap-recovery > summary { font-size: 1rem; font-weight: 650; }
+#swap-recovery-loaded { padding: 1rem; border: 1px solid #47605a; border-radius: .8rem; background: #20312c; }
+#swap-recovery-loaded h3 { margin-top: 0; color: #b6eccd; }
+#swap-recovery-loaded p:last-child { margin-bottom: 0; }
+#swap-recovery-key { padding: 1rem; border: 1px solid #344347; border-radius: .8rem; background: #162024; }
+#swap-recovery-key > summary { font-weight: 650; }
+#swap-recovery-funding-controls, #swap-refund-controls { margin-top: 1.5rem; padding-top: .5rem; border-top: 1px solid #344347; }
+#swap-recovery-result:not(:empty) { margin-top: 1.25rem; }
+.recovery-actions { display: flex; flex-wrap: wrap; gap: .75rem; }
+.recovery-actions:has(> :not([hidden])) { margin-top: 1rem; }
+.recovery-actions button { flex: 1 1 13rem; }
+.recovery-actions .primary { width: auto; margin-top: 0; }
+.recovery-backups:not(:empty) { display: grid; gap: .75rem; margin-top: 1rem; }
+.recovery-backups a { padding: .75rem; border: 1px solid #47605a; border-radius: .7rem; font-size: .8rem; }
 #swap-providers-list { display: grid; gap: 1.25rem; margin-top: 1rem; }
 #swap-provider-automatic { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 #swap-provider-automatic p { margin: 0; font-size: .85rem; }
@@ -113,6 +128,8 @@ details.utility-panel > summary { font-size: 1.1rem; font-weight: 650; }
 .saved-swap { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: .8rem 1.25rem; padding: 1rem; background: #223034; border: 1px solid #344347; border-radius: .8rem; }
 .saved-swap h3, .saved-swap p { margin: 0; }
 .saved-swap small { font-size: .73rem; }
+.saved-swap .saved-swap-amount { margin: .35rem 0 .15rem; color: #d4f4e2; font-size: 1.2rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.saved-swap-date { color: #c2d2d5; }
 .swap-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
 .swap-actions button, .swap-actions a { font-size: .75rem; }
 #swap-tracking { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: .65rem 1rem; }
@@ -181,6 +198,8 @@ footer button { background: transparent; border: 0; color: #aebfc3; font-size: .
   #swap-utilities button { font-size: .73rem; }
   .saved-swap { padding: .8rem; }
   .saved-swap .swap-actions { flex-basis: 100%; }
+  .recovery-actions { flex-direction: column; }
+  .recovery-actions button { width: 100%; flex: auto; }
   #swap-estimate:has(strong) { grid-template-columns: 1fr; }
   #swap-provider-automatic { align-items: flex-start; flex-direction: column; }
 }

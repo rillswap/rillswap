@@ -42,6 +42,7 @@ import { mountReverseExecution, mountResumedReverseExecution } from "./reverseEx
 import { BrowserReverseJournal } from "./browserReverseJournal";
 import { resumeBrowserReverseExecution } from "./browserReverseRecovery";
 import { decryptRecoveryContainer } from "./recoveryKeys";
+import { inspectRecoveryHistoryPlaintext } from "./recoveryInspection";
 import { requestSwapNotifications, notifyActivity } from "./swap/notifications";
 import { ActivityHistory, activityStatus, logText, type ActivityFacts, type ActivityObserver } from "./swap/activity";
 import { pageModuleUrl, publishedVersion } from "./publishedVersion";
@@ -74,6 +75,18 @@ function node<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", id?: str
   element.textContent = text;
   if (id) element.id = id;
   return element;
+}
+
+/** Invoice time is not a save, funding, or completion time. Invalid dates stay unknown. */
+function invoiceDate(createdAt?: number): HTMLElement {
+  const label = node("small", "Date unavailable"); label.className = "saved-swap-date";
+  if (createdAt === undefined || !Number.isSafeInteger(createdAt) || createdAt < 0) return label;
+  const date = new Date(createdAt * 1000);
+  if (!Number.isFinite(date.getTime())) return label;
+  const time = node("time", date.toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }));
+  time.dateTime = date.toISOString(); time.title = date.toISOString();
+  label.replaceChildren("Invoice created: ", time);
+  return label;
 }
 
 function field(root: HTMLElement, id: string, label: string, value = "", hint = ""): HTMLInputElement {
@@ -854,24 +867,55 @@ function mount(root: HTMLElement): void {
   const savedRecoveries = node("details", "", "swap-saved-recoveries");
   savedRecoveries.append(node("summary", "Your swaps"));
   const savedList = node("div", "Loading local recovery checkpoints...", "swap-saved-recoveries-list");
-  savedRecoveries.append(node("p", "Encrypted recovery checkpoints saved in this browser, including terms before a deposit is observed. Open a saved swap without uploading a file. Resume continues an existing swap without paying again."), savedList);
+  savedRecoveries.append(node("p", "Encrypted recovery checkpoints saved in this browser, including terms before a deposit is observed. Open a saved swap without uploading a file. Resume continues an existing swap without paying again."),
+    node("p", "Amounts describe the Lightning invoice or requested Bitcoin payout, not confirmed funds. Dates are invoice creation times, not completion times. Checkpoints with the same swap ID belong to the same swap."), savedList);
   addUtility(historyButton, savedRecoveries);
+  historyButton.onclick = () => {
+    const opening = selectedUtility !== historyButton;
+    showUtility(opening ? historyButton : undefined);
+    if (opening) void refreshSavedRecoveries(true);
+  };
   const openSavedRecoveries = node("button", "Open saved swaps", "swap-open-saved-recoveries"); openSavedRecoveries.type = "button";
   openSavedRecoveries.onclick = () => {
     if (busy) return;
-    showUtility(historyButton); savedRecoveries.open = true; void refreshSavedRecoveries();
+    showUtility(historyButton); savedRecoveries.open = true; void refreshSavedRecoveries(true);
   };
-  recoveryTools.prepend(openSavedRecoveries);
-  const refreshSavedRecoveries = async (): Promise<void> => {
+  recoveryTools.insertBefore(openSavedRecoveries, setup);
+  let historyGeneration = 0;
+  const refreshSavedRecoveries = async (inspectMetadata = false): Promise<void> => {
+    const generation = ++historyGeneration;
     try {
       const wallet = await walletPromise, entries = await wallet.listFundedRecoveries();
+      if (generation !== historyGeneration) return;
       savedList.replaceChildren();
+      // Only an explicit History opening decrypts backups. Startup and save callbacks stay cheap and disconnected.
+      let identity: Promise<string> | undefined;
+      const historyIdentity = () => identity ??= wallet.recoveryKey().then((key) => { key.file.fill(0); return key.identity; });
       for (const entry of entries) {
         const row = node("article"); row.className = "saved-swap"; savedList.append(row);
         if ("error" in entry) { row.append(node("p", entry.error)); continue; }
         const description = node("div"), actions = node("div"); actions.className = "swap-actions";
-        description.append(node("h3", "Saved checkpoint"), node("small", `${entry.network} · ${entry.id.slice(-16)}`));
+        const amount = node("p", "Amount unavailable"), direction = node("p", "Direction unavailable"); amount.className = "saved-swap-amount";
+        const date = invoiceDate();
+        description.append(node("h3", "Saved checkpoint"), amount, direction, node("small", `${entry.network} · ${entry.id.slice(-16)}`), date);
         row.append(description, actions);
+        if (inspectMetadata) void (async () => {
+          let plaintext: Uint8Array | undefined;
+          try {
+            if (generation !== historyGeneration || selectedUtility !== historyButton) return;
+            const snapshot = await wallet.readFundedRecovery(entry.id), key = await historyIdentity();
+            if (generation !== historyGeneration || selectedUtility !== historyButton) return;
+            plaintext = await decryptRecoveryContainer(snapshot.ciphertext, key);
+            const metadata = inspectRecoveryHistoryPlaintext(plaintext, NETWORKS[entry.network]);
+            if (generation !== historyGeneration || selectedUtility !== historyButton) return;
+            amount.textContent = `${BigInt(metadata.amountSat).toLocaleString()} sat`;
+            direction.textContent = "Bitcoin to Lightning";
+            description.append(node("small", "Lightning invoice amount · locally verified terms"), node("small", `Swap ${metadata.contractHash.slice(-16)}`));
+            date.replaceWith(invoiceDate(metadata.invoiceCreatedAt));
+          } catch {
+            if (generation === historyGeneration) description.append(node("small", "Details could not be verified with this browser's key. Open the checkpoint with its original key; the backup is unchanged."));
+          } finally { plaintext?.fill(0); }
+        })();
         for (const label of ["Open saved swap", "Prepare download"]) {
           const button = node("button", label); button.type = "button";
           button.onclick = () => {
@@ -902,6 +946,7 @@ function mount(root: HTMLElement): void {
       try {
         journal = await BrowserReverseJournal.open();
         const reverse = await journal.list();
+        if (generation !== historyGeneration) return;
         if (!entries.length && !reverse.length) savedList.append(node("p", "No swaps saved in this browser."));
         for (const record of reverse) {
           const name = (record.context.networkIdentity as { name: NetworkName }).name;
@@ -909,8 +954,10 @@ function mount(root: HTMLElement): void {
           const stages = { "secrets-ready": "Setup saved", "terms-ready": "Terms saved", "payment-unknown": "Payment needs checking", funded: "Funding recorded",
             "claim-ready": "Claim prepared", "claim-unknown": "Claim needs checking", accepted: "Claim submitted" } as const;
           const description = node("div");
+          const createdAt = record.payment?.state === "external-wallet" ? record.payment.invoiceBinding.created_at : record.payment?.plan.invoiceBinding.created_at;
           description.append(node("h3", `${BigInt(record.context.request.nominal_payout_sat).toLocaleString()} sat`),
-            node("p", "Lightning to Bitcoin"), node("small", `${name} · ${stages[record.stage]}`));
+            node("p", "Lightning to Bitcoin"), node("small", "Requested Bitcoin payout · saved local details"),
+            node("small", `${name} · ${stages[record.stage]}`), invoiceDate(createdAt), node("small", `Session ${record.context.sessionId.slice(-16)}`));
           row.append(description);
           const open = node("button", "Resume"); open.type = "button";
           row.append(open); savedList.append(row);
@@ -942,10 +989,11 @@ function mount(root: HTMLElement): void {
           };
         }
       } catch {
+        if (generation !== historyGeneration) return;
         savedList.append(node("p", "Could not read reverse swap recoveries. Other saved checkpoints remain available, if present. " +
           "Reverse records were left unchanged; preserve backups and do not automatically retry them.", "swap-saved-reverse-error"));
       } finally { journal?.close(); }
-    } catch (error) { savedList.textContent = `Could not read saved recoveries: ${(error as Error).message}`; }
+    } catch (error) { if (generation === historyGeneration) savedList.textContent = `Could not read saved recoveries: ${(error as Error).message}`; }
   };
   void refreshSavedRecoveries();
   if (link) {
@@ -954,7 +1002,7 @@ function mount(root: HTMLElement): void {
     linkBox.hidden = false;
     showTracking("Swap record");
     setStatus("Swap record opened from its link", -1, "ready");
-    recovery.load(link.file, "swap-link.age");
+    recovery.load(link.file, "swap-link.age", "link");
     showUtility(recoveryButton, false);
   }
   // Following another swap link while this page is open is a fragment-only navigation; reload so

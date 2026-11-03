@@ -177,6 +177,13 @@ stage; **Resume** continues funding checks and claims, never a Lightning payment
 Forward checkpoints open recovery locally, including deposit discovery from
 terms-only records. Each saved stage is a separate immutable checkpoint, not
 proof of funding. Merely listing swaps does not connect, pay, sign, or broadcast.
+Opening History explicitly decrypts forward checkpoints locally to verify their
+direction, Lightning invoice amount, invoice creation date, and shared swap ID.
+Startup and checkpoint-saving paths do not decrypt the saved collection. Reverse
+rows use their validated local request, stage, and invoice metadata without
+decrypting snapshots. Dates are labeled **Invoice created**, not saved or
+completed; unavailable details stay unknown while backup actions remain usable.
+No metadata is backfilled or written to existing checkpoints.
 Keep a backup independently: browser eviction can still remove local records.
 If reverse-recovery storage is unavailable or incompatible, History shows an
 explicit warning without hiding forward checkpoints. The refused reverse
@@ -454,7 +461,11 @@ backup or the bookmarked tracking link. On another device, enter the 12 words or
 choose the JSON/age key backup. This does not replace the current browser key or
 reset address counters. The link carries
 an encrypted recovery container in its URL fragment (never sent to the
-server); treat it like the file. Opening or reloading never retries payments,
+server); treat it like the file. The recovery panel confirms that the encrypted
+swap is already loaded and offers **Unlock with your original recovery key**.
+Use the original 12 words or key backup and **Unlock and inspect swap**; no
+separate `.age` file is needed. If this browser already holds the matching key,
+local inspection opens the swap automatically. Opening or reloading never retries payments,
 claims or refunds by itself. Resume is explicit and never starts a new cooperative
 nonce attempt.
 

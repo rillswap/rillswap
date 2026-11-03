@@ -17,6 +17,8 @@ export function reverseRecoveryControls(root: HTMLElement, options: {
   const document = Uint8Array.from(options.plaintext), network = structuredClone(options.network); let disposed = false, busy = false;
   const current = (): void => { if (disposed) throw new Error("Selection changed"); options.assertCurrent(); };
   const report = inspectReverseRecoveryPlaintext(document, network), message = node("p", "", "swap-reverse-recovery-message"), controls = node("section"), files = node("section");
+  const lookupActions = node("div"); lookupActions.className = "recovery-actions"; controls.append(lookupActions);
+  files.className = "recovery-backups";
   const timing = node("p", recoveryTiming({ profile: "ln-to-btc/v1", network: report.networkName,
     refundLockHeight: report.refundLockHeight, claimMarginBlocks: report.claimConfirmationBlocks }), "swap-reverse-recovery-time");
   let confirmSaved: (saved: { claimTxid: string | null; claimFeeSat: string | null; stage: string }) => void = () => {};
@@ -32,10 +34,10 @@ export function reverseRecoveryControls(root: HTMLElement, options: {
     })
       .finally(() => { busy = false; if (!disposed) control.disabled = control.dataset.locked === "true"; });
   }; };
-  const local = button(controls, "Inspect local execution state", "swap-reverse-recovery-local");
+  const local = button(lookupActions, "Inspect local execution state", "swap-reverse-recovery-local");
   act(local, async () => { current(); const saved = await loadBrowserReverseRecovery(document, options.identity, network); current();
     message.textContent = `Local state: ${saved.stage}. This is not a new payment authorization.`; download(files, saved.ciphertext, "rillswap-reverse-latest.age"); confirmSaved(saved); });
-  const archive = button(controls, "Recover signed funding from selected relays", "swap-reverse-recovery-archive");
+  const archive = button(lookupActions, "Recover signed funding from selected relays", "swap-reverse-recovery-archive");
   controls.append(node("small", "Archive lookup uses the original recipient key. It publishes nothing. Missing signed evidence cannot be inferred from a UTXO."));
   act(archive, async () => { current(); const relays = [...options.relays()], captured = relays.join("\n");
     const approve = (): void => { current(); if (options.relays().join("\n") !== captured) throw new Error("Relays changed"); };
@@ -43,7 +45,7 @@ export function reverseRecoveryControls(root: HTMLElement, options: {
     download(files, file, "rillswap-reverse-funded.age"); message.textContent = "Save and inspect this funded backup before continuing."; });
   if (report.fundingHistory.length) {
     const binding = report.fundingHistory.at(-1)!, selection = { fundingAttemptId: binding.funding_attempt_id, bindingRevision: binding.binding_revision };
-    const check = button(controls, "Check reverse funding with selected API", "swap-reverse-recovery-check");
+    const check = button(lookupActions, "Check reverse funding with selected API", "swap-reverse-recovery-check");
     act(check, async () => { current(); const api = options.chainApi(), observedAt = Date.now(), observation = await observeReverseRecoveryFunding(document, network, selection, api); current();
       if (options.chainApi() !== api) throw new Error("API changed");
       timing.textContent = recoveryTiming({ profile: "ln-to-btc/v1", network: report.networkName, refundLockHeight: report.refundLockHeight,
@@ -55,7 +57,8 @@ export function reverseRecoveryControls(root: HTMLElement, options: {
     const consent = node("p", "By preparing the claim you confirm you recognize this file, control the fixed payout address, approve this fee, and keep the funded backup. Prior exposure may be UNKNOWN; exporting or broadcasting reveals your preimage.", "swap-reverse-recovery-consent");
     consent.className = "swap-consent";
     controls.append(feeLabel, fee, consent);
-    const prepare = button(controls, "Approve and prepare recovery claim", "swap-reverse-recovery-prepare");
+    const prepareActions = node("div"); prepareActions.className = "recovery-actions"; controls.append(prepareActions);
+    const prepare = button(prepareActions, "Approve and prepare recovery claim", "swap-reverse-recovery-prepare");
     prepare.className = "primary";
     const claimStatus = node("p", "First prepare a claim or inspect local execution state to obtain its exact encrypted backup.", "swap-reverse-recovery-claim-status");
     claimStatus.className = "swap-consent";
@@ -79,7 +82,8 @@ export function reverseRecoveryControls(root: HTMLElement, options: {
       message.textContent = saved.stage === "claim-unknown" || saved.stage === "accepted"
         ? "Exact claim bytes are saved; prior exposure is unknown. Only identical manual export is available."
         : "Exact claim bytes are saved, not yet exposed. Keep the claim backup; export or broadcast it when ready."; });
-    const exportClaim = button(controls, "Approve and download exact saved claim", "swap-reverse-recovery-export"), broadcast = button(controls, "Approve and broadcast saved claim once", "swap-reverse-recovery-broadcast");
+    const exposureActions = node("div"); exposureActions.className = "recovery-actions"; controls.append(exposureActions);
+    const exportClaim = button(exposureActions, "Approve and download exact saved claim", "swap-reverse-recovery-export"), broadcast = button(exposureActions, "Approve and broadcast saved claim once", "swap-reverse-recovery-broadcast");
     broadcast.className = "primary";
     const expose = async (action: "download" | "broadcast"): Promise<void> => { const approval = capturedApproval(), claimTxid = savedClaimTxid;
       const exposureApproved = (): void => { approval.check(); if (!claimTxid || savedClaimTxid !== claimTxid) throw new Error("No exact claim backup is prepared"); };

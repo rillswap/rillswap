@@ -331,6 +331,23 @@ export function inspectRecoveryPlaintext(plaintext: Uint8Array, independentlySel
     }))) });
 }
 
+export interface RecoveryHistoryInspection {
+  readonly verification: "historical-static";
+  readonly profileId: "btc-to-ln/v1";
+  readonly networkName: string;
+  readonly contractHash: string;
+  readonly amountSat: string;
+  readonly invoiceCreatedAt: number;
+}
+
+/** Public History labels only, not funding status, provenance, or spending authority. */
+export function inspectRecoveryHistoryPlaintext(plaintext: Uint8Array, independentlySelectedNetwork: unknown): RecoveryHistoryInspection {
+  const record = authenticateRecovery(plaintext, independentlySelectedNetwork);
+  const terms = record.contract_terms as BtcToLnTerms;
+  return Object.freeze({ verification: "historical-static", profileId: "btc-to-ln/v1", networkName: record.network_identity.name,
+    contractHash: record.contract_hash, amountSat: terms.economics.lightning_principal_sat, invoiceCreatedAt: terms.invoice_binding.created_at });
+}
+
 export interface RecoveryDepositTarget {
   readonly contractHash: string;
   readonly scriptPubkey: string;

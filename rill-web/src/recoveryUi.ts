@@ -47,25 +47,34 @@ export interface RecoveryPanel {
   readonly element: HTMLElement;
   clearFundingObservation(): void;
   /** Open the panel on an in-memory recovery container (for example from a swap link) and inspect it locally. */
-  load(file: Uint8Array, name: string): void;
+  load(file: Uint8Array, name: string, source?: "link" | "saved"): void;
 }
 
 /** A collapsed panel with local imports and explicitly requested, report-only chain reads. */
 export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
   const details = element("details", "", "swap-recovery");
-  details.append(element("summary", "Recover a swap"), element("p",
+  const intro = element("section");
+  intro.append(element("p",
     "Open an encrypted swap recovery file using your saved browser key. " +
     "Choose the original swap's network in Settings. Files and keys stay on this device."), element("p",
     "Recovering on another site or browser also requires the original recovery words or key backup. " +
     "The encrypted .age file cannot be opened with the network alone. There is no domain restriction, but each site has separate browser key storage."));
+  details.append(element("summary", "Recover a swap"), intro);
+  const loaded = element("section", "", "swap-recovery-loaded"); loaded.hidden = true;
+  const loadedTitle = element("h3"), loadedHelp = element("p");
+  loaded.append(loadedTitle, loadedHelp);
+  const fileChoice = element("details", "", "swap-recovery-file-choice"); fileChoice.open = true;
+  const fileSummary = element("summary", "Choose a recovery file");
   const fileLabel = element("label", "Encrypted swap recovery file (.age)");
   const file = element("input", "", "swap-recovery-file");
   file.type = "file";
   file.accept = ".age";
   fileLabel.htmlFor = file.id;
-  details.append(fileLabel, file);
-  const olderKey = element("details");
-  olderKey.append(element("summary", "Use a saved recovery key (optional)"), element("p",
+  fileChoice.append(fileSummary, fileLabel, file);
+  details.append(loaded, fileChoice);
+  const olderKey = element("details", "", "swap-recovery-key");
+  const keySummary = element("summary", "Use a saved recovery key (optional)");
+  olderKey.append(keySummary, element("p",
     "Enter the original site's 12 words or choose its key backup. This is required if the file uses a different key from this browser's saved key. " +
     "One mnemonic can unlock many swap files; your browser's saved key is not replaced."));
   const wordsLabel = element("label", "12-word recovery key"), words = element("input", "", "swap-recovery-words");
@@ -98,19 +107,21 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
   const txid = element("input", "", "swap-recovery-deposit-txid"); txid.type = "text"; txid.maxLength = 64; txid.spellcheck = false; txid.autocomplete = "off";
   txidLabel.htmlFor = txid.id;
   const discover = element("button", "Find deposits", "swap-recovery-find-deposits"); discover.type = "button";
+  const discoveryActions = element("div"); discoveryActions.className = "recovery-actions"; discoveryActions.append(discover);
   const discoveryResult = element("section", "", "swap-recovery-discovery-result"); discoveryResult.setAttribute("aria-live", "polite");
   fundingControls.append(element("h3", "Find your escrow deposit"), element("p",
     "Your original terms backup can recover deposits without the provider or a recorded funding revision. Find deposits queries your selected chain API with the public escrow address, or only the transaction ID entered below. Your file and keys stay here."),
-    txidLabel, txid, discover, discoveryResult);
+    txidLabel, txid, discoveryActions, discoveryResult);
   const revisionLabel = element("label", "Recorded funding revision");
   const revision = element("select", "", "swap-recovery-revision");
   revisionLabel.htmlFor = revision.id;
   const check = element("button", "Check funding", "swap-recovery-check-funding");
   check.type = "button";
+  const checkActions = element("div"); checkActions.className = "recovery-actions"; checkActions.append(check);
   const fundingResult = element("section", "", "swap-recovery-funding-result");
   fundingResult.setAttribute("aria-live", "polite");
   fundingControls.append(revisionLabel, revision, element("p",
-    "Check funding connects to the API selected in Settings for this attempt. It sends the selected public transaction ID, never your recovery file or key."), check, fundingResult);
+    "Check funding connects to the API selected in Settings for this attempt. It sends the selected public transaction ID, never your recovery file or key."), checkActions, fundingResult);
   const refundControls = element("section", "", "swap-refund-controls");
   const destination = element("p", "", "swap-refund-destination");
   const feeLabel = element("label", "Total refund transaction fee (sat)");
@@ -126,10 +137,13 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
   const broadcast = element("button", "Broadcast refund", "swap-refund-broadcast"); broadcast.type = "button"; broadcast.hidden = true;
   broadcast.className = "primary";
   const refundResult = element("section", "", "swap-refund-result"); refundResult.setAttribute("aria-live", "polite");
+  const prepareActions = element("div"), exposureActions = element("div");
+  prepareActions.className = exposureActions.className = "recovery-actions";
+  prepareActions.append(prepare); exposureActions.append(download, broadcast);
   refundControls.append(element("h3", "Refund to the signed destination"), destination, feeLabel, fee, amount,
     element("p", "An imported file cannot prove ownership of this address. Verify it in your wallet before approving. The signed destination cannot be changed."),
     element("p", "After the timeout, a refund can still race a provider claim if the provider learned the payment preimage. Check your Lightning wallet; an API observation cannot eliminate that race."),
-    consent, prepare, download, broadcast, refundResult);
+    consent, prepareActions, exposureActions, refundResult);
   fundingControls.append(refundControls);
   details.append(olderKey, inspect, result, fundingControls);
   let busy = false;
@@ -154,7 +168,12 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
     pendingInvalidated = true; invalidateRefund();
     if (!busy) { result.replaceChildren(); fundingResult.replaceChildren(); discoveryResult.replaceChildren(); candidates = []; fundingControls.hidden = true; inspected = undefined; }
   };
-  file.onchange = keyFile.onchange = clear;
+  file.onchange = () => {
+    intro.hidden = false; loaded.hidden = true; fileChoice.open = true; fileSummary.textContent = "Choose a recovery file";
+    keySummary.textContent = "Use a saved recovery key (optional)"; inspect.textContent = "Inspect recovery file";
+    clear();
+  };
+  keyFile.onchange = clear;
   words.oninput = clear;
   const show = (report: RecoveryInspection): void => {
     inspected = report;
@@ -223,7 +242,7 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
         if (!plaintext) {
           olderKey.open = true;
           result.replaceChildren(element("p", "Could not verify this recovery file. The encrypted file could not be opened with this key. " +
-            "If it came from another site or browser, enter the original recovery words or key backup under Use a saved recovery key. " +
+            "If it came from another site or browser, enter the original recovery words or key backup in the recovery key section above. " +
             "This site cannot read another site's browser-stored key. Keep your original backups; nothing was changed or uploaded."));
         } else {
           result.replaceChildren(element("p", "Could not verify this recovery file. The file decrypted, but its record could not be verified for the current selection. " +
@@ -397,12 +416,21 @@ export function recoveryPanel(options: RecoveryUiOptions): RecoveryPanel {
   return {
     element: details,
     clearFundingObservation() { pendingInvalidated = true; fundingResult.replaceChildren(); invalidateRefund(); },
-    load(bytes, name) {
+    load(bytes, name, source = "saved") {
       // The same path as a chosen file: the input holds it, so every later action rechecks the same selection.
       const transfer = new DataTransfer();
       transfer.items.add(new File([Uint8Array.from(bytes)], name, { type: "application/octet-stream" }));
       file.files = transfer.files;
       clear();
+      intro.hidden = true;
+      loaded.hidden = false;
+      loadedTitle.textContent = source === "link" ? "Encrypted swap loaded from your saved link" : "Encrypted swap loaded from this browser";
+      loadedHelp.textContent = "Your encrypted recovery data is already loaded. You do not need to choose a separate .age file. " +
+        "We will try this browser's saved key. If it does not unlock the swap, enter the original 12 words below or choose the original key backup, then unlock and inspect. " +
+        "The link alone cannot decrypt your swap. Your words and keys stay on this device.";
+      fileChoice.open = false; fileSummary.textContent = "Open a different recovery file";
+      olderKey.open = true; keySummary.textContent = "Unlock with your original recovery key";
+      inspect.textContent = "Unlock and inspect swap";
       details.open = true;
       inspect.click();
     },
