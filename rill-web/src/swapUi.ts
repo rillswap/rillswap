@@ -898,8 +898,9 @@ function mount(root: HTMLElement): void {
           actions.append(button);
         }
       }
-      const journal = await BrowserReverseJournal.open();
+      let journal: BrowserReverseJournal | undefined;
       try {
+        journal = await BrowserReverseJournal.open();
         const reverse = await journal.list();
         if (!entries.length && !reverse.length) savedList.append(node("p", "No swaps saved in this browser."));
         for (const record of reverse) {
@@ -940,7 +941,10 @@ function mount(root: HTMLElement): void {
             });
           };
         }
-      } finally { journal.close(); }
+      } catch {
+        savedList.append(node("p", "Could not read reverse swap recoveries. Other saved checkpoints remain available, if present. " +
+          "Reverse records were left unchanged; preserve backups and do not automatically retry them.", "swap-saved-reverse-error"));
+      } finally { journal?.close(); }
     } catch (error) { savedList.textContent = `Could not read saved recoveries: ${(error as Error).message}`; }
   };
   void refreshSavedRecoveries();

@@ -178,6 +178,9 @@ Forward checkpoints open recovery locally, including deposit discovery from
 terms-only records. Each saved stage is a separate immutable checkpoint, not
 proof of funding. Merely listing swaps does not connect, pay, sign, or broadcast.
 Keep a backup independently: browser eviction can still remove local records.
+If reverse-recovery storage is unavailable or incompatible, History shows an
+explicit warning without hiding forward checkpoints. The refused reverse
+records remain unchanged; no automatic repair or retry is attempted.
 Upgrades preserve existing recovery identities and counters, without retroactive
 checkpoints, record rewrites, or automatic network actions. Older terms files
 that were never stored still need their download or bookmarked swap link. The
